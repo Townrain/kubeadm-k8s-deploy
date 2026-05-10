@@ -8,9 +8,9 @@
 
 | 文件 | 说明 |
 |------|------|
-| `deploy-k8s-cluster.sh` | **主脚本**，在线/离线部署，SSH 远程配置 Worker |
-| `deploy-k8s-vars.sh` | 变量库，可集中修改版本/镜像源/路径 |
-| `deploy-k8s.env` | 环境变量，预填主机名/IP/密码跳过交互 |
+| `deploy-k8s-cluster.sh` | **主脚本**，独立可运行，内置全部默认值 |
+| `deploy-k8s-vars.sh` | 变量库（可选），覆盖主脚本默认版本/镜像源/路径 |
+| `deploy-k8s.env` | 环境变量（可选），预填主机名/IP/密码跳过交互 |
 | `build-offline-iso.sh` | 构建离线 ISO，拉取 RPM/镜像/清单打包 |
 | `k8s-offline-repo.iso` | 离线镜像包（由 `build-offline-iso.sh` 生成） |
 | `## 📋 Kubeadm v1.md` | 原部署手册（本文档的参考来源） |
@@ -19,7 +19,14 @@
 
 ## 🚀 快速开始
 
-### 在线部署
+### 一键部署
+
+```bash
+# 在线模式 (全部交互式)
+bash <(curl -fsSL https://raw.githubusercontent.com/Townrain/kubeadm-k8s-deploy/main/deploy-k8s-cluster.sh)
+```
+
+### 在线部署 (完整步骤)
 
 ```bash
 # 1. 可选的变量预填 (跳过交互)
