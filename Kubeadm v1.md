@@ -1,5 +1,3 @@
-## 🤖 Assistant
-
 ## 📋 Kubeadm v1.35.4 部署 Kubernetes 集群手册（CentOS Stream 9）
 
 **已验证环境：** CentOS Stream 9 · containerd v2.2.3 · Calico v3.32.0 · Dashboard v7.14.0  
