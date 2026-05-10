@@ -1,0 +1,6 @@
+# 离线 ISO (建议提交前先运行 build-offline-iso.sh 生成)
+k8s-offline-repo.iso
+# 密码文件 (包含节点 SSH 密码)
+deploy-k8s.env
+# 部署日志
+/tmp/*.log
