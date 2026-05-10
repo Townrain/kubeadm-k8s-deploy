@@ -7,12 +7,20 @@
 ###############################################################################
 set -euo pipefail
 
+# 尝试加载变量库
+if [ -f "$(dirname "$0")/deploy-k8s-vars.sh" ]; then
+    source "$(dirname "$0")/deploy-k8s-vars.sh"
+fi
+
 # ==================== 版本配置 ====================
-K8S_VERSION="v1.35.4"
-CRICTL_VERSION="v1.35.0"
-CALICO_VERSION="v3.32.0"
-HELM_VERSION="v3.19.0"
-DASHBOARD_VERSION="7.14.0"
+K8S_VERSION="${K8S_VERSION:-v1.35.4}"
+CRICTL_VERSION="${CRICTL_VERSION:-v1.35.0}"
+CALICO_VERSION="${CALICO_VERSION:-v3.32.0}"
+HELM_VERSION="${HELM_VERSION:-v3.19.0}"
+DASHBOARD_VERSION="${DASHBOARD_VERSION:-7.14.0}"
+
+MIRROR_DOCKER="${MIRROR_DOCKER_ENDPOINT:-https://docker.1panel.live}"
+MIRROR_QUAY="${MIRROR_QUAY_ENDPOINT:-https://quay.m.daocloud.io}"
 
 # ==================== 路径配置 ====================
 WORK_DIR="/tmp/k8s-offline-build"
@@ -75,8 +83,7 @@ download_rpms() {
 name=Docker CE
 baseurl=https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/centos/\$releasever/\$basearch/stable
 enabled=1
-gpgcheck=1
-gpgkey=https://download.docker.com/linux/centos/gpg
+gpgcheck=0
 timeout=30
 EOF
 
@@ -179,7 +186,7 @@ pull_and_export_images() {
         sed -i "${rl}a\\
     [plugins.'io.containerd.cri.v1.images'.registry.mirrors]\\
       [plugins.'io.containerd.cri.v1.images'.registry.mirrors.\"docker.io\"]\\
-        endpoint = [\"https://docker.1panel.live\"]" /etc/containerd/config.toml
+        endpoint = [\"${MIRROR_DOCKER}\"]" /etc/containerd/config.toml
     fi
     systemctl daemon-reload 2>/dev/null || true
     systemctl restart containerd 2>/dev/null || true
