@@ -819,9 +819,14 @@ interactive_main() {
     echo ""
     log_warn "建议在各节点执行 reboot 验证 Swap 持久禁用"
 
-    # 离线模式: 自动卸载 ISO
+    # 离线模式: 自动卸载 ISO 并恢复外部仓库
     if [ "$OFFLINE_MODE" -eq 1 ]; then
         umount_offline_iso "$OFFLINE_MOUNT" 2>/dev/null || true
+        rm -f /etc/yum.repos.d/k8s-offline.repo 2>/dev/null || true
+        [ -f /etc/yum.repos.d/docker-ce.repo.bak ] && mv /etc/yum.repos.d/docker-ce.repo.bak /etc/yum.repos.d/docker-ce.repo 2>/dev/null || true
+        [ -f /etc/yum.repos.d/kubernetes.repo.bak ] && mv /etc/yum.repos.d/kubernetes.repo.bak /etc/yum.repos.d/kubernetes.repo 2>/dev/null || true
+        dnf config-manager --enable docker-ce-stable 2>/dev/null || true
+        log_info "已卸载 ISO 并恢复外部仓库"
     fi
 }
 
