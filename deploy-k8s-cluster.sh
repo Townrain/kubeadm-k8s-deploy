@@ -41,7 +41,6 @@ else
     FILES=(
         deploy-k8s-cluster.sh
         deploy-k8s-vars.sh
-        deploy-k8s.env
     )
     for f in "${FILES[@]}"; do
         printf "  下载 %s ... " "$f"
@@ -646,7 +645,7 @@ interactive_main() {
         WORKER2_HOSTNAME="${WORKER2_HOSTNAME:-node2}"
         WORKER2_IP="${WORKER2_IP:-}"
         WORKER2_USER="${WORKER2_USER:-root}"
-        POD_CIDR="${POD_CIDR:-172.16.10.0/24}"
+POD_CIDR="${POD_CIDR:-172.16.0.0/16}"
         SVC_CIDR="${SVC_CIDR:-172.16.32.0/24}"
 
         echo "========== 部署模式 =========="
