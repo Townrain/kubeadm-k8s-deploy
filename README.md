@@ -22,7 +22,6 @@
 ### 一键部署
 
 ```bash
-# 在线模式 (全部交互式)
 bash <(curl -fsSL https://raw.githubusercontent.com/Townrain/kubeadm-k8s-deploy/main/deploy-k8s-cluster.sh)
 ```
 
