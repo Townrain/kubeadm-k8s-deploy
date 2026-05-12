@@ -129,16 +129,16 @@ download_binaries() {
     log_info "下载 crictl ${CRICTL_VERSION}..."
     github_dl "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz"
     tar -zxf "crictl-${CRICTL_VERSION}-linux-amd64.tar.gz"
+    cp crictl /usr/local/bin/crictl    # 当前系统用
     rm -f "crictl-${CRICTL_VERSION}-linux-amd64.tar.gz"
-    log_info "crictl 已解压"
 
     # helm
     log_info "下载 helm ${HELM_VERSION}..."
     github_dl "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
     tar -zxf "helm-${HELM_VERSION}-linux-amd64.tar.gz"
+    cp linux-amd64/helm /usr/local/bin/helm
     mv linux-amd64/helm .
     rm -rf linux-amd64 "helm-${HELM_VERSION}-linux-amd64.tar.gz"
-    log_info "helm 已解压"
 }
 
 # ==================== 4. 下载清单 ====================
@@ -181,16 +181,32 @@ pull_and_export_images() {
         containerd config default > /etc/containerd/config.toml
     fi
     sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml 2>/dev/null || true
+    sed -i "s|sandbox = 'registry.k8s.io/pause:3.10.1'|sandbox = 'registry.aliyuncs.com/google_containers/pause:3.10.1'|g" /etc/containerd/config.toml 2>/dev/null || true
     local rl=$(grep -n "plugins.'io.containerd.cri.v1.images'.registry" /etc/containerd/config.toml | head -1 | cut -d: -f1)
     if ! grep -q "docker.1panel.live" /etc/containerd/config.toml 2>/dev/null; then
         sed -i "${rl}a\\
     [plugins.'io.containerd.cri.v1.images'.registry.mirrors]\\
       [plugins.'io.containerd.cri.v1.images'.registry.mirrors.\"docker.io\"]\\
-        endpoint = [\"${MIRROR_DOCKER}\"]" /etc/containerd/config.toml
+        endpoint = [\"${MIRROR_DOCKER}\"]\\
+      [plugins.'io.containerd.cri.v1.images'.registry.mirrors.\"quay.io\"]\\
+        endpoint = [\"${MIRROR_QUAY}\"]\\
+      [plugins.'io.containerd.cri.v1.images'.registry.mirrors.\"gcr.io\"]\\
+        endpoint = [\"https://gcr.m.daocloud.io\"]" /etc/containerd/config.toml
     fi
     systemctl daemon-reload 2>/dev/null || true
+    systemctl enable containerd --now 2>/dev/null || true
     systemctl restart containerd 2>/dev/null || true
     sleep 3
+
+    # crictl 配置
+    if [ ! -f /etc/crictl.yaml ]; then
+        cat > /etc/crictl.yaml << 'EOF'
+runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+timeout: 30
+debug: false
+EOF
+    fi
 
     # 拉取函数 (最多重试 3 次, 间隔 5s)
     try_pull() {
@@ -212,15 +228,16 @@ pull_and_export_images() {
         "registry.aliyuncs.com/google_containers/kube-controller-manager:${K8S_VERSION}"
         "registry.aliyuncs.com/google_containers/kube-scheduler:${K8S_VERSION}"
         "registry.aliyuncs.com/google_containers/kube-proxy:${K8S_VERSION}"
-        "registry.aliyuncs.com/google_containers/etcd:3.5.21-0"
+        "registry.aliyuncs.com/google_containers/etcd:3.6.6-0"
+        "registry.aliyuncs.com/google_containers/coredns:v1.13.1"
         "registry.aliyuncs.com/google_containers/pause:3.10.1"
     )
-    # 注: CoreDNS 由 kubeadm init 自动安装, 不需要手动拉取
 
     for img in "${kubeadm_images[@]}"; do
         local fname=$(echo "$img" | sed 's|[/:]|_|g').tar
         log_info "  ${img}"
         try_pull "$img" || { log_warn "拉取失败: ${img}"; continue; }
+        sync; sleep 1
         ctr -n k8s.io images export "$fname" "$img" 2>/dev/null || log_warn "导出失败: ${img}"
     done
 
@@ -236,6 +253,7 @@ pull_and_export_images() {
         local fname=$(echo "$img" | sed 's|[/:]|_|g').tar
         log_info "  ${img}"
         try_pull "$img" || { log_warn "拉取失败: ${img}"; continue; }
+        sync; sleep 1
         ctr -n k8s.io images export "$fname" "$img" 2>/dev/null || log_warn "导出失败: ${img}"
     done
 
@@ -252,6 +270,7 @@ pull_and_export_images() {
         local fname=$(echo "$img" | sed 's|[/:]|_|g').tar
         log_info "  ${img}"
         try_pull "$img" || { log_warn "拉取失败: ${img}"; continue; }
+        sync; sleep 1
         ctr -n k8s.io images export "$fname" "$img" 2>/dev/null || log_warn "导出失败: ${img}"
     done
 

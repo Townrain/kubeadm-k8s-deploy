@@ -1,27 +1,91 @@
 #!/bin/bash
 ###############################################################################
 # Kubeadm v1.35.4 部署 Kubernetes 集群一键脚本（SSH 远程模式）
-# 运行位置: Master 节点
-# 执行方式: bash deploy-k8s-cluster.sh [--offline] [--iso /path/to/iso]
-# 功能:     在线/离线模式 → SSH 远程配置所有节点 → 一键部署集群
-# SSH:      自动生成密钥 + ssh-copy-id 免密一次，后续全部免密
-# 网络:     Master 网卡/网关自动检测；Worker 节点 SSH 远程自动检测
+#
+# 本地运行:
+#   bash deploy-k8s-cluster.sh
+#   bash deploy-k8s-cluster.sh --offline
+#
+# 远程一键运行:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/Townrain/kubeadm-k8s-deploy/main/deploy-k8s-cluster.sh) --keep
+#   bash <(curl -fsSL https://raw.githubusercontent.com/Townrain/kubeadm-k8s-deploy/main/deploy-k8s-cluster.sh)
 ###############################################################################
 
 set -euo pipefail
 
-# 尝试加载变量库 (不存在则从 GitHub 自动拉取)
-VARS_URL="https://raw.githubusercontent.com/Townrain/kubeadm-k8s-deploy/main/deploy-k8s-vars.sh"
-if [ ! -f "$(dirname "$0")/deploy-k8s-vars.sh" ]; then
-    curl -fsSL "$VARS_URL" -o "$(dirname "$0")/deploy-k8s-vars.sh" 2>/dev/null || true
-fi
-if [ -f "$(dirname "$0")/deploy-k8s-vars.sh" ]; then
-    source "$(dirname "$0")/deploy-k8s-vars.sh"
+# ==================== 自举: 从 GitHub 下载缺失脚本 ====================
+GITHUB_BASE="https://raw.githubusercontent.com/Townrain/kubeadm-k8s-deploy/main"
+KEEP_SCRIPTS=0
+BOOTSTRAPPED=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --keep)  KEEP_SCRIPTS=1 ;;
+        --remote|--offline|--iso) ;;  # 传给下层
+    esac
+done
+
+_CANDIDATE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+if [ -n "${_CANDIDATE_DIR:-}" ] && [ -f "${_CANDIDATE_DIR}/deploy-k8s-vars.sh" ]; then
+    SCRIPT_DIR="${_CANDIDATE_DIR}"
+else
+    SCRIPT_DIR="$(mktemp -d /tmp/k8s-deploy-XXXXXX)"
+    BOOTSTRAPPED=1
+
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║  检测到通过 curl 管道运行，正在从 GitHub 下载脚本...       ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+
+    FILES=(
+        deploy-k8s-cluster.sh
+        deploy-k8s-vars.sh
+        deploy-k8s.env
+    )
+    for f in "${FILES[@]}"; do
+        printf "  下载 %s ... " "$f"
+        if curl -sSL --connect-timeout 10 "${GITHUB_BASE}/${f}" -o "${SCRIPT_DIR}/${f}" 2>/dev/null; then
+            echo "OK"
+        elif [ "$f" = "deploy-k8s.env" ]; then
+            echo "跳过 (.env 可选)"
+        else
+            echo "失败"
+            echo ""
+            echo "  无法从 ${GITHUB_BASE} 下载脚本"
+            echo "  请检查网络后重试"
+            exit 1
+        fi
+    done
+    chmod +x "${SCRIPT_DIR}/deploy-k8s-cluster.sh"
+    echo ""
+    echo "  所有脚本下载完成，开始部署..."
+    echo ""
+
+    # 重新执行下载后的脚本
+    if [ "$KEEP_SCRIPTS" -eq 1 ]; then
+        echo "  --keep 模式，脚本保留在 ${SCRIPT_DIR}"
+        exec bash "${SCRIPT_DIR}/deploy-k8s-cluster.sh" "$@"
+    else
+        trap "rm -rf '${SCRIPT_DIR}'" EXIT
+        exec bash "${SCRIPT_DIR}/deploy-k8s-cluster.sh" "$@"
+    fi
 fi
 
-# 加载环境变量 (预填主机名/IP/密码，可跳过交互)
-if [ -f "$(dirname "$0")/deploy-k8s.env" ]; then
-    source "$(dirname "$0")/deploy-k8s.env"
+# ==================== 以下为正常执行路径 ====================
+
+# 加载变量库 (curl|bash 时自动下载, 本地运行时同级目录)
+VARS_URL="${GITHUB_BASE}/deploy-k8s-vars.sh"
+if [ ! -f "${SCRIPT_DIR}/deploy-k8s-vars.sh" ]; then
+    curl -fsSL "$VARS_URL" -o "${SCRIPT_DIR}/deploy-k8s-vars.sh" 2>/dev/null || true
+fi
+if [ -f "${SCRIPT_DIR}/deploy-k8s-vars.sh" ]; then
+    source "${SCRIPT_DIR}/deploy-k8s-vars.sh"
+fi
+
+# 加载环境变量 (可选, 填好可跳过交互)
+if [ -f "${SCRIPT_DIR}/deploy-k8s.env" ]; then
+    source "${SCRIPT_DIR}/deploy-k8s.env"
     PRELOADED=1
 else
     PRELOADED=0
@@ -309,7 +373,7 @@ load_offline_images() {
                 [ -f "$tarfile" ] || continue
                 [ -s "$tarfile" ] || { log_warn "跳过空文件: $(basename "$tarfile")"; continue; }
                 local fname=$(basename "$tarfile")
-                if ctr -n k8s.io images import "$tarfile" 2>&1 | grep -q "saved"; then
+                if ctr -n k8s.io images import "$tarfile" &>/dev/null; then
                     log_info "✓ ${fname}"; count1=$((count1 + 1))
                 else
                     log_warn "导入失败: ${fname}"; failed1=$((failed1 + 1))
@@ -318,7 +382,7 @@ load_offline_images() {
             # Kong 镜像 (如果存在)
             local kong_tar="${img_dir}/kong_3.9.tar"
             if [ -f "$kong_tar" ] && [ -s "$kong_tar" ]; then
-                if ctr -n k8s.io images import "$kong_tar" 2>&1 | grep -q "saved"; then
+                if ctr -n k8s.io images import "$kong_tar" &>/dev/null; then
                     log_info "✓ kong_3.9.tar"; count1=$((count1 + 1))
                 else
                     log_warn "导入失败: kong_3.9.tar"; failed1=$((failed1 + 1))
@@ -340,7 +404,7 @@ load_offline_images() {
         [ -s "$tarfile" ] || { log_warn "跳过空文件: $(basename "$tarfile")"; continue; }
 
         local fname=$(basename "$tarfile")
-        if ctr -n k8s.io images import "$tarfile" 2>&1 | grep -q "saved"; then
+        if ctr -n k8s.io images import "$tarfile" &>/dev/null; then
             log_info "✓ ${fname}"
             count=$((count + 1))
         else
@@ -395,7 +459,7 @@ remote_deploy_worker() {
 
     # 复制脚本到 Worker
     local script_path
-    script_path="$(readlink -f "$0")"
+    local script_path="${SCRIPT_DIR}/deploy-k8s-cluster.sh"
     scp -o StrictHostKeyChecking=no "$script_path" "${user}@${ip}:/root/${REMOTE_SCRIPT_NAME:-deploy-k8s-cluster.sh}"
 
     # 离线模式: 复制 ISO 到 Worker
@@ -716,7 +780,7 @@ interactive_main() {
     # ========== 7. SCP 关键文件到 Worker ==========
     log_step "【阶段二】分发二进制到 Worker 节点"
     local script_path
-    script_path="$(readlink -f "$0")"
+    local script_path="${SCRIPT_DIR}/deploy-k8s-cluster.sh"
     local remote_script="/root/${REMOTE_SCRIPT_NAME:-deploy-k8s-cluster.sh}"
 
     scp -o StrictHostKeyChecking=no "$script_path" "${WORKER1_USER}@${WORKER1_IP}:${remote_script}"
