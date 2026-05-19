@@ -345,10 +345,13 @@ EOF
 
     log_info "仓库目录: ${repo_base}"
 
-    # 禁用外部仓库
-    dnf config-manager --disable docker-ce-stable 2>/dev/null || true
-    [ -f /etc/yum.repos.d/kubernetes.repo ] && mv /etc/yum.repos.d/kubernetes.repo /etc/yum.repos.d/kubernetes.repo.bak 2>/dev/null || true
-    [ -f /etc/yum.repos.d/docker-ce.repo ] && mv /etc/yum.repos.d/docker-ce.repo /etc/yum.repos.d/docker-ce.repo.bak 2>/dev/null || true
+    # 禁用所有在线仓库（离线模式专用）
+    # 备份并禁用系统仓库 (baseos, appstream, crb 等)
+    for repo_file in /etc/yum.repos.d/*.repo; do
+        [ -f "$repo_file" ] || continue
+        [ "$repo_file" = "/etc/yum.repos.d/k8s-offline.repo" ] && continue
+        mv "$repo_file" "${repo_file}.bak" 2>/dev/null || true
+    done
 
     dnf makecache
     log_info "离线仓库配置完成: file://${repo_base}"
@@ -456,10 +459,11 @@ remote_deploy_worker() {
 
     setup_ssh_keys "$user" "$ip" "$hostname"
 
-    # 复制脚本到 Worker
-    local script_path
+    # 复制脚本到 Worker（主脚本 + 变量库）
     local script_path="${SCRIPT_DIR}/deploy-k8s-cluster.sh"
+    local vars_path="${SCRIPT_DIR}/deploy-k8s-vars.sh"
     scp -o StrictHostKeyChecking=no "$script_path" "${user}@${ip}:/root/${REMOTE_SCRIPT_NAME:-deploy-k8s-cluster.sh}"
+    [ -f "$vars_path" ] && scp -o StrictHostKeyChecking=no "$vars_path" "${user}@${ip}:/root/deploy-k8s-vars.sh"
 
     # 离线模式: 复制 ISO 到 Worker
     if [ "$OFFLINE_MODE" -eq 1 ]; then
@@ -645,7 +649,7 @@ interactive_main() {
         WORKER2_HOSTNAME="${WORKER2_HOSTNAME:-node2}"
         WORKER2_IP="${WORKER2_IP:-}"
         WORKER2_USER="${WORKER2_USER:-root}"
-POD_CIDR="${POD_CIDR:-172.16.0.0/16}"
+POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
         SVC_CIDR="${SVC_CIDR:-172.16.32.0/24}"
 
         echo "========== 部署模式 =========="
@@ -778,12 +782,14 @@ POD_CIDR="${POD_CIDR:-172.16.0.0/16}"
 
     # ========== 7. SCP 关键文件到 Worker ==========
     log_step "【阶段二】分发二进制到 Worker 节点"
-    local script_path
     local script_path="${SCRIPT_DIR}/deploy-k8s-cluster.sh"
+    local vars_path="${SCRIPT_DIR}/deploy-k8s-vars.sh"
     local remote_script="/root/${REMOTE_SCRIPT_NAME:-deploy-k8s-cluster.sh}"
 
     scp -o StrictHostKeyChecking=no "$script_path" "${WORKER1_USER}@${WORKER1_IP}:${remote_script}"
     scp -o StrictHostKeyChecking=no "$script_path" "${WORKER2_USER}@${WORKER2_IP}:${remote_script}"
+    [ -f "$vars_path" ] && scp -o StrictHostKeyChecking=no "$vars_path" "${WORKER1_USER}@${WORKER1_IP}:/root/deploy-k8s-vars.sh"
+    [ -f "$vars_path" ] && scp -o StrictHostKeyChecking=no "$vars_path" "${WORKER2_USER}@${WORKER2_IP}:/root/deploy-k8s-vars.sh"
 
     # 离线模式: 复制 ISO
     if [ "$OFFLINE_MODE" -eq 1 ]; then
@@ -882,14 +888,17 @@ POD_CIDR="${POD_CIDR:-172.16.0.0/16}"
     echo ""
     log_warn "建议在各节点执行 reboot 验证 Swap 持久禁用"
 
-    # 离线模式: 自动卸载 ISO 并恢复外部仓库
+    # 离线模式: 自动卸载 ISO 并恢复所有仓库
     if [ "$OFFLINE_MODE" -eq 1 ]; then
         umount_offline_iso "$OFFLINE_MOUNT" 2>/dev/null || true
         rm -f /etc/yum.repos.d/k8s-offline.repo 2>/dev/null || true
-        [ -f /etc/yum.repos.d/docker-ce.repo.bak ] && mv /etc/yum.repos.d/docker-ce.repo.bak /etc/yum.repos.d/docker-ce.repo 2>/dev/null || true
-        [ -f /etc/yum.repos.d/kubernetes.repo.bak ] && mv /etc/yum.repos.d/kubernetes.repo.bak /etc/yum.repos.d/kubernetes.repo 2>/dev/null || true
-        dnf config-manager --enable docker-ce-stable 2>/dev/null || true
-        log_info "已卸载 ISO 并恢复外部仓库"
+        # 恢复所有备份的仓库文件
+        for repo_bak in /etc/yum.repos.d/*.repo.bak; do
+            [ -f "$repo_bak" ] || continue
+            mv "$repo_bak" "${repo_bak%.bak}" 2>/dev/null || true
+        done
+        dnf makecache 2>/dev/null || true
+        log_info "已卸载 ISO 并恢复所有在线仓库"
     fi
 }
 
