@@ -1,14 +1,21 @@
 #!/bin/bash
 ###############################################################################
-# Kubeadm v1.35.4 部署 Kubernetes 集群一键脚本（SSH 远程模式）
+# Kubeadm v1.35.4 一键部署 Kubernetes 集群（SSH 远程模式）
+#
+# 特性:
+#   - 支持 CentOS Stream 9 / 10
+#   - 双容器运行时: containerd（默认）或 Docker + cri-dockerd
+#   - 1 Master + 1/2 Worker 灵活部署
+#   - 在线 / 离线双模式
+#   - 国内镜像加速（阿里云/清华/中科大）
+#   - 已修复 kubeadm v1.35 super-admin.conf bug
+#
+# 一键运行:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/Townrain/kubeadm-k8s-deploy/main/deploy-k8s-cluster.sh)
 #
 # 本地运行:
 #   bash deploy-k8s-cluster.sh
 #   bash deploy-k8s-cluster.sh --offline
-#
-# 远程一键运行:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/Townrain/kubeadm-k8s-deploy/main/deploy-k8s-cluster.sh) --keep
-#   bash <(curl -fsSL https://raw.githubusercontent.com/Townrain/kubeadm-k8s-deploy/main/deploy-k8s-cluster.sh)
 ###############################################################################
 
 set -euo pipefail
@@ -131,6 +138,7 @@ HELM_VERSION="${HELM_VERSION:-v3.19.0}"
 DASHBOARD_VERSION="${DASHBOARD_VERSION:-7.14.0}"
 POD_CIDR="${POD_CIDR:-172.16.10.0/24}"
 SVC_CIDR="${SVC_CIDR:-172.16.32.0/24}"
+CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-containerd}"  # containerd 或 docker
 
 # 镜像与注册表
 KUBEADM_IMAGE_REPO="${KUBEADM_IMAGE_REPO:-registry.aliyuncs.com/google_containers}"
@@ -161,13 +169,9 @@ CONTAINERD_SOCK="${CONTAINERD_SOCK:-unix:///run/containerd/containerd.sock}"
 CRICTL_CFG="${CRICTL_CONFIG:-/etc/crictl.yaml}"
 K8S_REPO="${KUBERNETES_REPO_FILE:-/etc/yum.repos.d/kubernetes.repo}"
 KUBELET_CFG="${KUBELET_EXTRA_ARGS_FILE:-/etc/sysconfig/kubelet}"
-DASH_SVC="${DASHBOARD_PORT_FORWARD_SERVICE:-/etc/systemd/system/dashboard-portforward.service}"
 DASH_NS="${DASHBOARD_NAMESPACE:-kubernetes-dashboard}"
 DASH_SA="${DASHBOARD_SA:-dashboard-admin}"
 DASH_TOKEN_TTL="${DASHBOARD_TOKEN_DURATION:-24h}"
-DASH_KONG_SVC="${DASHBOARD_KONG_SVC:-svc/dashboard-kong-proxy}"
-DASH_PORT_LOCAL="${DASHBOARD_PORT_FORWARD_LOCAL:-8443}"
-DASH_PORT_REMOTE="${DASHBOARD_PORT_FORWARD_REMOTE:-443}"
 NM_DIR="${NM_CONNECTION_DIR:-/etc/NetworkManager/system-connections}"
 SELINUX_CFG="${SELINUX_CONFIG:-/etc/selinux/config}"
 PROFILE="${PROFILE_FILE:-/etc/profile}"
@@ -262,6 +266,25 @@ github_dl() {
     done
     return 1
 }
+
+# ==================== CentOS 版本检测 ====================
+get_centos_version() {
+    # 返回 CentOS Stream 主版本号 (9 或 10)
+    if [ -f /etc/os-release ]; then
+        local version_id
+        version_id=$(grep '^VERSION_ID=' /etc/os-release | cut -d'"' -f2 | cut -d'.' -f1)
+        echo "${version_id:-9}"
+    else
+        echo "9"
+    fi
+}
+
+is_centos_stream_10() {
+    local ver
+    ver=$(get_centos_version)
+    [ "$ver" -ge 10 ] 2>/dev/null && return 0 || return 1
+}
+
 get_remote_default_gw_iface() {
     local user="$1" ip="$2"
     ssh -o BatchMode=yes -o ConnectTimeout=${SSH_TMOUT} "${user}@${ip}" \
@@ -424,6 +447,12 @@ load_offline_images() {
 
 # 导出 Master 所有镜像 → SCP 到 Worker (避免 Worker 各自拉取)
 sync_images_to_workers() {
+    # Docker 运行时跳过 (使用 Docker registry mirrors 拉取)
+    if [ "${CONTAINER_RUNTIME}" = "docker" ]; then
+        log_info "Docker 运行时: 跳过 ctr 镜像同步 (Worker 将通过 Docker registry mirrors 拉取)"
+        return 0
+    fi
+
     local sync_dir="/tmp/k8s-sync-images"
     rm -rf "$sync_dir"; mkdir -p "$sync_dir"
 
@@ -432,12 +461,19 @@ sync_images_to_workers() {
         [ -z "$img" ] && continue
         local fname="${sync_dir}/$(echo "$img" | sed 's|[/:@]|_|g').tar"
         ctr -n k8s.io images export "$fname" "$img" 2>/dev/null || true
-    done
+    done || true
 
-    local count=$(ls "$sync_dir"/*.tar 2>/dev/null | wc -l)
+    local count
+    count=$(ls "$sync_dir"/*.tar 2>/dev/null | wc -l)
     [ "$count" -eq 0 ] && { log_info "无镜像需同步"; rm -rf "$sync_dir"; return; }
 
-    for w in "${WORKER1_USER}@${WORKER1_IP}" "${WORKER2_USER}@${WORKER2_IP}"; do
+    # 构建 Worker 列表
+    local workers=("${WORKER1_USER}@${WORKER1_IP}")
+    if [ "${WORKER_COUNT:-2}" -ge 2 ] && [ -n "${WORKER2_IP:-}" ]; then
+        workers+=("${WORKER2_USER}@${WORKER2_IP}")
+    fi
+
+    for w in "${workers[@]}"; do
         log_info "同步 ${count} 个镜像到 ${w}..."
         scp -o StrictHostKeyChecking=no "$sync_dir"/*.tar "$w:/tmp/k8s-sync-images/" 2>/dev/null || { log_warn "SCP 失败: ${w}"; continue; }
         ssh -o StrictHostKeyChecking=no "$w" "
@@ -487,7 +523,7 @@ remote_mode_execute() {
     local hostname="$1" iface="$2" wip="$3" prefix="$4" gateway="$5"
     local master_hostname="$6" master_ip="$7"
     local worker1_hostname="$8" worker1_ip="$9"
-    local worker2_hostname="${10}" worker2_ip="${11}"
+    local worker2_hostname="${10:-}" worker2_ip="${11:-}"
 
     # 把变量注入全局，供 common_prep 和 configure_hosts 使用
     MASTER_HOSTNAME="$master_hostname"
@@ -496,6 +532,12 @@ remote_mode_execute() {
     WORKER1_IP="$worker1_ip"
     WORKER2_HOSTNAME="$worker2_hostname"
     WORKER2_IP="$worker2_ip"
+    # 自动检测 Worker 数量
+    if [ -n "$worker2_ip" ]; then
+        WORKER_COUNT=2
+    else
+        WORKER_COUNT=1
+    fi
 
     log_info "远程模式 — Worker 节点: ${hostname} (${wip})"
     [ "$OFFLINE_MODE" -eq 1 ] && log_info "离线模式已启用 (ISO: ${OFFLINE_ISO})"
@@ -634,7 +676,7 @@ interactive_main() {
     echo ""
     echo "╔══════════════════════════════════════════════════════════════╗"
     echo "║   Kubeadm v1.35.4 部署 Kubernetes 集群 (SSH 远程模式)      ║"
-    echo "║   Master → SSH → Worker1/Worker2                           ║"
+    echo "║   Master → SSH → Worker 节点                               ║"
     [ "$PRELOADED" -eq 1 ] && echo "║   deploy-k8s.env 已加载，按回车使用预设值                    ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo ""
@@ -646,10 +688,16 @@ interactive_main() {
         WORKER1_HOSTNAME="${WORKER1_HOSTNAME:-node1}"
         WORKER1_IP="${WORKER1_IP:-}"
         WORKER1_USER="${WORKER1_USER:-root}"
-        WORKER2_HOSTNAME="${WORKER2_HOSTNAME:-node2}"
+        WORKER2_HOSTNAME="${WORKER2_HOSTNAME:-}"
         WORKER2_IP="${WORKER2_IP:-}"
         WORKER2_USER="${WORKER2_USER:-root}"
-POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
+        # 自动检测 Worker 数量: WORKER2 为空则为 1 Worker 模式
+        if [ -n "${WORKER2_IP:-}" ]; then
+            WORKER_COUNT="${WORKER_COUNT:-2}"
+        else
+            WORKER_COUNT=1
+        fi
+        POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
         SVC_CIDR="${SVC_CIDR:-172.16.32.0/24}"
 
         echo "========== 部署模式 =========="
@@ -678,6 +726,26 @@ POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
             [ ! -f "$OFFLINE_ISO" ] && { log_error "ISO 不存在: ${OFFLINE_ISO}"; exit 1; }
             log_info "离线模式已启用 (ISO: ${OFFLINE_ISO})"
         fi
+
+        # ========== 容器运行时选择 (仅 CentOS Stream 10) ==========
+        if is_centos_stream_10; then
+            echo ""
+            echo "========== 容器运行时 (CentOS Stream 10) =========="
+            echo "  [1] containerd (推荐，内置 CRI)"
+            echo "  [2] Docker + cri-dockerd (可选)"
+            echo ""
+            read -r -p "请选择 [1]: " runtime_choice
+            runtime_choice="${runtime_choice:-1}"
+            if [ "$runtime_choice" = "2" ]; then
+                CONTAINER_RUNTIME="docker"
+                log_info "已选择 Docker + cri-dockerd 运行时"
+            else
+                CONTAINER_RUNTIME="containerd"
+                log_info "已选择 containerd 运行时"
+            fi
+        else
+            CONTAINER_RUNTIME="containerd"
+        fi
     fi
 
     if [ "$PRELOADED" -eq 1 ]; then
@@ -689,8 +757,20 @@ POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
         MASTER_HOSTNAME="${MASTER_HOSTNAME:-master}"
         read -r -p "Worker1 主机名 [node1]: " WORKER1_HOSTNAME
         WORKER1_HOSTNAME="${WORKER1_HOSTNAME:-node1}"
-        read -r -p "Worker2 主机名 [node2]: " WORKER2_HOSTNAME
-        WORKER2_HOSTNAME="${WORKER2_HOSTNAME:-node2}"
+
+        # 询问是否添加 Worker2
+        echo ""
+        read -r -p "是否添加第二个 Worker 节点? [y/N]: " add_worker2
+        if [[ "$add_worker2" =~ ^[Yy]$ ]]; then
+            WORKER_COUNT=2
+            read -r -p "Worker2 主机名 [node2]: " WORKER2_HOSTNAME
+            WORKER2_HOSTNAME="${WORKER2_HOSTNAME:-node2}"
+        else
+            WORKER_COUNT=1
+            WORKER2_HOSTNAME=""
+            WORKER2_IP=""
+            log_info "单 Worker 模式: 仅部署 1 Master + 1 Worker"
+        fi
 
         echo ""
         echo "网络规划 (按需修改):"
@@ -715,26 +795,35 @@ POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
         read -r -p "Worker1 SSH 用户名 [root]: " WORKER1_USER
         WORKER1_USER="${WORKER1_USER:-root}"
 
-        echo ""
-        read -r -p "Worker2 IP: " WORKER2_IP
-        read -r -p "Worker2 SSH 用户名 [root]: " WORKER2_USER
-        WORKER2_USER="${WORKER2_USER:-root}"
+        if [ "${WORKER_COUNT:-2}" -ge 2 ] && [ -n "${WORKER2_HOSTNAME:-}" ]; then
+            echo ""
+            read -r -p "Worker2 IP: " WORKER2_IP
+            read -r -p "Worker2 SSH 用户名 [root]: " WORKER2_USER
+            WORKER2_USER="${WORKER2_USER:-root}"
+        fi
     fi
 
     # ========== 3. 建立 SSH 免密 ==========
     setup_ssh_keys "$WORKER1_USER" "$WORKER1_IP" "$WORKER1_HOSTNAME"
-    setup_ssh_keys "$WORKER2_USER" "$WORKER2_IP" "$WORKER2_HOSTNAME"
+    if [ "${WORKER_COUNT:-2}" -ge 2 ] && [ -n "${WORKER2_IP:-}" ]; then
+        setup_ssh_keys "$WORKER2_USER" "$WORKER2_IP" "$WORKER2_HOSTNAME"
+    fi
 
     # ========== 4. 远程检测 Worker 网络 ==========
     if [ "$PRELOADED" -eq 1 ] && [ -n "${WORKER1_IFACE:-}" ]; then
-        WORKER1_PREFIX="${WORKER1_PREFIX:-24}"; WORKER2_PREFIX="${WORKER2_PREFIX:-24}"
+        WORKER1_PREFIX="${WORKER1_PREFIX:-24}"
+        if [ "${WORKER_COUNT:-2}" -ge 2 ] && [ -n "${WORKER2_IP:-}" ]; then
+            WORKER2_PREFIX="${WORKER2_PREFIX:-24}"
+        fi
         log_info "使用预设 Worker 网络"
     else
         auto_detect_worker_network "$WORKER1_USER" "$WORKER1_IP" "$WORKER1_HOSTNAME" \
             "WORKER1_IFACE" "WORKER1_IP" "WORKER1_PREFIX" "WORKER1_GW"
 
-        auto_detect_worker_network "$WORKER2_USER" "$WORKER2_IP" "$WORKER2_HOSTNAME" \
-            "WORKER2_IFACE" "WORKER2_IP" "WORKER2_PREFIX" "WORKER2_GW"
+        if [ "${WORKER_COUNT:-2}" -ge 2 ] && [ -n "${WORKER2_IP:-}" ]; then
+            auto_detect_worker_network "$WORKER2_USER" "$WORKER2_IP" "$WORKER2_HOSTNAME" \
+                "WORKER2_IFACE" "WORKER2_IP" "WORKER2_PREFIX" "WORKER2_GW"
+        fi
     fi
 
     # ========== 5. 确认摘要 ==========
@@ -747,9 +836,11 @@ POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
     echo "║                                                             "
     echo "║  [Worker1] ${WORKER1_HOSTNAME}                              "
     echo "║    网卡: ${WORKER1_IFACE}   IP: ${WORKER1_IP}/${WORKER1_PREFIX}   网关: ${WORKER1_GW:-无}"
-    echo "║                                                             "
-    echo "║  [Worker2] ${WORKER2_HOSTNAME}                              "
-    echo "║    网卡: ${WORKER2_IFACE}   IP: ${WORKER2_IP}/${WORKER2_PREFIX}   网关: ${WORKER2_GW:-无}"
+    if [ "${WORKER_COUNT:-2}" -ge 2 ] && [ -n "${WORKER2_IP:-}" ]; then
+        echo "║                                                             "
+        echo "║  [Worker2] ${WORKER2_HOSTNAME}                              "
+        echo "║    网卡: ${WORKER2_IFACE}   IP: ${WORKER2_IP}/${WORKER2_PREFIX}   网关: ${WORKER2_GW:-无}"
+    fi
     echo "║                                                             "
     echo "║  Pod 网段: ${POD_CIDR}     Service 网段: ${SVC_CIDR}        "
     echo "╚══════════════════════════════════════════════════════════════╝"
@@ -787,26 +878,42 @@ POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
     local remote_script="/root/${REMOTE_SCRIPT_NAME:-deploy-k8s-cluster.sh}"
 
     scp -o StrictHostKeyChecking=no "$script_path" "${WORKER1_USER}@${WORKER1_IP}:${remote_script}"
-    scp -o StrictHostKeyChecking=no "$script_path" "${WORKER2_USER}@${WORKER2_IP}:${remote_script}"
     [ -f "$vars_path" ] && scp -o StrictHostKeyChecking=no "$vars_path" "${WORKER1_USER}@${WORKER1_IP}:/root/deploy-k8s-vars.sh"
-    [ -f "$vars_path" ] && scp -o StrictHostKeyChecking=no "$vars_path" "${WORKER2_USER}@${WORKER2_IP}:/root/deploy-k8s-vars.sh"
+
+    if [ "${WORKER_COUNT:-2}" -ge 2 ] && [ -n "${WORKER2_IP:-}" ]; then
+        scp -o StrictHostKeyChecking=no "$script_path" "${WORKER2_USER}@${WORKER2_IP}:${remote_script}"
+        [ -f "$vars_path" ] && scp -o StrictHostKeyChecking=no "$vars_path" "${WORKER2_USER}@${WORKER2_IP}:/root/deploy-k8s-vars.sh"
+    fi
 
     # 离线模式: 复制 ISO
     if [ "$OFFLINE_MODE" -eq 1 ]; then
         log_info "离线模式: 复制 ISO 到 Worker 节点..."
         scp -o StrictHostKeyChecking=no "$OFFLINE_ISO" "${WORKER1_USER}@${WORKER1_IP}:${OFFLINE_ISO}" &
-        scp -o StrictHostKeyChecking=no "$OFFLINE_ISO" "${WORKER2_USER}@${WORKER2_IP}:${OFFLINE_ISO}" &
+        if [ "${WORKER_COUNT:-2}" -ge 2 ] && [ -n "${WORKER2_IP:-}" ]; then
+            scp -o StrictHostKeyChecking=no "$OFFLINE_ISO" "${WORKER2_USER}@${WORKER2_IP}:${OFFLINE_ISO}" &
+        fi
         wait
     fi
 
     # 在线或离线: 把 Master 已下载的二进制和镜像 SCP 给 Worker
-    for w in "${WORKER1_USER}@${WORKER1_IP}" "${WORKER2_USER}@${WORKER2_IP}"; do
+    local workers=("${WORKER1_USER}@${WORKER1_IP}")
+    if [ "${WORKER_COUNT:-2}" -ge 2 ] && [ -n "${WORKER2_IP:-}" ]; then
+        workers+=("${WORKER2_USER}@${WORKER2_IP}")
+    fi
+
+    for w in "${workers[@]}"; do
         log_info "分发二进制/镜像到 ${w}..."
         ssh -o StrictHostKeyChecking=no "$w" "mkdir -p /usr/local/bin /tmp/k8s-images" 2>/dev/null || true
 
         # 二进制
         [ -f /usr/local/bin/crictl ] && scp -o StrictHostKeyChecking=no /usr/local/bin/crictl "$w:/usr/local/bin/crictl" 2>/dev/null || true
         [ -f /usr/local/bin/helm   ] && scp -o StrictHostKeyChecking=no /usr/local/bin/helm   "$w:/usr/local/bin/helm"   2>/dev/null || true
+        # cri-dockerd (仅 Docker 运行时)
+        if [ "${CONTAINER_RUNTIME}" = "docker" ] && [ -f /usr/local/bin/cri-dockerd ]; then
+            log_info "分发 cri-dockerd 到 ${w}..."
+            scp -o StrictHostKeyChecking=no /usr/local/bin/cri-dockerd "$w:/usr/local/bin/cri-dockerd" 2>/dev/null || log_warn "SCP cri-dockerd 到 ${w} 失败"
+            ssh -o StrictHostKeyChecking=no "$w" "chmod +x /usr/local/bin/cri-dockerd" 2>/dev/null || true
+        fi
 
         # 镜像
         if [ -d /tmp/k8s-images ] && ls /tmp/k8s-images/*.tar &>/dev/null; then
@@ -817,22 +924,25 @@ POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
 
     # ========== 8. 远程部署 Worker ==========
     log_step "【阶段三】远程部署 Worker 节点"
-    log_info "并行部署 Worker1 和 Worker2 (约 5~10 分钟)..."
+    log_info "并行部署 Worker 节点 (约 5~10 分钟)..."
+
     ssh -o StrictHostKeyChecking=no "${WORKER1_USER}@${WORKER1_IP}" \
-        "bash ${remote_script} --remote ${OFFLINE_REMOTE_FLAG} \
+        "export CONTAINER_RUNTIME='${CONTAINER_RUNTIME}'; bash ${remote_script} --remote ${OFFLINE_REMOTE_FLAG} \
             '${WORKER1_HOSTNAME}' '${WORKER1_IFACE}' '${WORKER1_IP}' '${WORKER1_PREFIX}' '${WORKER1_GW}' \
             '${MASTER_HOSTNAME}' '${MASTER_IP}' \
             '${WORKER1_HOSTNAME}' '${WORKER1_IP}' \
-            '${WORKER2_HOSTNAME}' '${WORKER2_IP}'" > /tmp/worker1-deploy.log 2>&1 &
+            '${WORKER2_HOSTNAME:-}' '${WORKER2_IP:-}'" > /tmp/worker1-deploy.log 2>&1 &
     PID1=$!
 
-    ssh -o StrictHostKeyChecking=no "${WORKER2_USER}@${WORKER2_IP}" \
-        "bash ${remote_script} --remote ${OFFLINE_REMOTE_FLAG} \
-            '${WORKER2_HOSTNAME}' '${WORKER2_IFACE}' '${WORKER2_IP}' '${WORKER2_PREFIX}' '${WORKER2_GW}' \
-            '${MASTER_HOSTNAME}' '${MASTER_IP}' \
-            '${WORKER1_HOSTNAME}' '${WORKER1_IP}' \
-            '${WORKER2_HOSTNAME}' '${WORKER2_IP}'" > /tmp/worker2-deploy.log 2>&1 &
-    PID2=$!
+    if [ "${WORKER_COUNT:-2}" -ge 2 ] && [ -n "${WORKER2_IP:-}" ]; then
+        ssh -o StrictHostKeyChecking=no "${WORKER2_USER}@${WORKER2_IP}" \
+            "export CONTAINER_RUNTIME='${CONTAINER_RUNTIME}'; bash ${remote_script} --remote ${OFFLINE_REMOTE_FLAG} \
+                '${WORKER2_HOSTNAME}' '${WORKER2_IFACE}' '${WORKER2_IP}' '${WORKER2_PREFIX}' '${WORKER2_GW}' \
+                '${MASTER_HOSTNAME}' '${MASTER_IP}' \
+                '${WORKER1_HOSTNAME}' '${WORKER1_IP}' \
+                '${WORKER2_HOSTNAME}' '${WORKER2_IP}'" > /tmp/worker2-deploy.log 2>&1 &
+        PID2=$!
+    fi
 
     # ========== 9. 等待 Worker 完成 ==========
     log_step "【等待 Worker 节点部署完成】"
@@ -840,9 +950,11 @@ POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
     wait $PID1 2>/dev/null || log_warn "Worker1 部署可能有异常，请查看 /tmp/worker1-deploy.log"
     log_info "Worker1 完成"
 
-    log_info "等待 Worker2 (PID=$PID2)..."
-    wait $PID2 2>/dev/null || log_warn "Worker2 部署可能有异常，请查看 /tmp/worker2-deploy.log"
-    log_info "Worker2 完成"
+    if [ "${WORKER_COUNT:-2}" -ge 2 ] && [ -n "${WORKER2_IP:-}" ] && [ -n "${PID2:-}" ]; then
+        log_info "等待 Worker2 (PID=$PID2)..."
+        wait $PID2 2>/dev/null || log_warn "Worker2 部署可能有异常，请查看 /tmp/worker2-deploy.log"
+        log_info "Worker2 完成"
+    fi
 
     # ========== 10. Master 初始化集群 ==========
     log_step "【阶段四】Master 初始化 Kubernetes 集群"
@@ -873,7 +985,9 @@ POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
     echo "╠══════════════════════════════════════════════════════════════╣"
     echo "║  Master:  ${MASTER_IP} (${MASTER_HOSTNAME})                  "
     echo "║  Worker1: ${WORKER1_IP} (${WORKER1_HOSTNAME})                "
-    echo "║  Worker2: ${WORKER2_IP} (${WORKER2_HOSTNAME})                "
+    if [ "${WORKER_COUNT:-2}" -ge 2 ] && [ -n "${WORKER2_IP:-}" ]; then
+        echo "║  Worker2: ${WORKER2_IP} (${WORKER2_HOSTNAME})                "
+    fi
     echo "║                                                             "
     echo "║  常用命令:                                                   "
     echo "║    kubectl get nodes                                         "
@@ -881,8 +995,9 @@ POD_CIDR="${POD_CIDR:-10.244.0.0/16}"
     echo "║    kubectl get events -A --sort-by='.lastTimestamp'          "
     echo "║                                                             "
     if [ -f ${K8S_DIR}/dashboard-token ]; then
-        echo "║  Dashboard: https://${MASTER_IP}:${DASH_PORT_LOCAL}                       "
-        echo "║  Token: $(cat ${K8S_DIR}/dashboard-token)                     "
+        local dash_port=$(cat ${K8S_DIR}/dashboard-port 2>/dev/null || echo "?")
+        echo "║  Dashboard: https://${MASTER_IP}:${dash_port}                       "
+        echo "║  Token:     cat ${K8S_DIR}/dashboard-token              "
     fi
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo ""
@@ -907,11 +1022,18 @@ init_master_cluster() {
     log_step "Master 节点: 初始化 Kubernetes 集群"
     mkdir -p ${K8S_DIR} && cd ${K8S_DIR}
 
+    # 根据容器运行时选择 CRI socket
+    local cri_socket
+    if [ "${CONTAINER_RUNTIME}" = "docker" ]; then
+        cri_socket="unix:///var/run/cri-dockerd.sock"
+    else
+        cri_socket="${CONTAINERD_SOCK}"
+    fi
+
     cat > kubeadm-config.yaml << EOF
 apiVersion: ${K8S_API_VER}
 kind: ClusterConfiguration
 kubernetesVersion: ${K8S_VERSION}
-controlPlaneEndpoint: "${MASTER_IP}:${API_PORT}"
 imageRepository: ${KUBEADM_IMAGE_REPO}
 networking:
   podSubnet: "${POD_CIDR}"
@@ -921,6 +1043,8 @@ apiServer:
   certSANs:
     - ${MASTER_IP}
     - ${MASTER_HOSTNAME}
+    - 127.0.0.1
+    - localhost
   extraArgs:
     - name: authorization-mode
       value: ${K8S_AUTH_MODE}
@@ -939,7 +1063,7 @@ localAPIEndpoint:
   advertiseAddress: ${MASTER_IP}
   bindPort: ${API_PORT}
 nodeRegistration:
-  criSocket: ${CONTAINERD_SOCK}
+  criSocket: ${cri_socket}
   name: ${MASTER_HOSTNAME}
 ---
 apiVersion: kubeproxy.config.k8s.io/v1alpha1
@@ -956,11 +1080,45 @@ EOF
     if [ "$OFFLINE_MODE" -eq 1 ]; then
         load_offline_images "kubeadm"
     else
-        kubeadm config images pull --config ${KUBEADM_YAML}
+        kubeadm config images pull --config ${KUBEADM_YAML} --cri-socket "${cri_socket}"
+    fi
+
+    # Docker 运行时: 预拉取 pause 镜像并 tag (registry.k8s.io 被墙)
+    if [ "${CONTAINER_RUNTIME}" = "docker" ]; then
+        log_info "预拉取 pause 镜像 (使用国内源)..."
+        local pause_mirror="${KUBEADM_IMAGE_REPO}/pause:3.10.1"
+        local pause_official="${PAUSE_IMAGE}"
+        if ! docker pull "${pause_mirror}" 2>/dev/null; then
+            # 回退: 尝试多个国内源
+            docker pull "registry.aliyuncs.com/google_containers/pause:3.10.1" 2>/dev/null || \
+            docker pull "registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.10.1" 2>/dev/null || \
+            docker pull "pause:3.10.1" 2>/dev/null
+        fi
+        docker tag "registry.aliyuncs.com/google_containers/pause:3.10.1" "registry.k8s.io/pause:3.10.1" 2>/dev/null || true
+        docker tag "registry.aliyuncs.com/google_containers/pause:3.10.1" "registry.k8s.io/pause:3.10" 2>/dev/null || true
+        log_info "pause 镜像已准备好"
+    fi
+
+    # 重启 cri-dockerd 确保 socket 状态正常 (Docker 运行时)
+    if [ "${CONTAINER_RUNTIME}" = "docker" ]; then
+        log_info "重启 cri-dockerd 确保 socket 状态正常..."
+        systemctl restart cri-dockerd.service 2>/dev/null || true
+        sleep 3
     fi
 
     kubeadm init --config ${KUBEADM_YAML} --upload-certs \
         --ignore-preflight-errors=${K8S_PREFLIGHT} 2>&1 | tee ${KUBEADM_LOG}
+    
+    # 检查 kubeadm init 是否成功
+    if ! grep -q "Your Kubernetes control-plane has initialized successfully" ${KUBEADM_LOG} 2>/dev/null; then
+        log_error "kubeadm init 失败，请查看日志: ${KUBEADM_LOG}"
+        log_error "可能原因:"
+        log_error "  1. CRI socket 配置错误"
+        log_error "  2. 容器运行时未正确启动"
+        log_error "  3. 镜像拉取失败"
+        log_error "  4. 网络问题"
+        exit 1
+    fi
 
     mkdir -p $HOME/.kube
     cp -i ${KUBE_CONFIG} ${KUBE_CONFIG_HOME}
@@ -986,18 +1144,31 @@ join_workers() {
     local join_hash=$(cat ${K8S_DIR}/join-hash 2>/dev/null | tr -d '\n' || echo "")
     [ -z "$join_token" ] && { log_warn "未找到 token"; return 1; }
 
-    local entries=("${WORKER1_USER}@${WORKER1_IP}|${WORKER1_HOSTNAME}" "${WORKER2_USER}@${WORKER2_IP}|${WORKER2_HOSTNAME}")
+    # 构建 Worker 列表
+    local entries=("${WORKER1_USER}@${WORKER1_IP}|${WORKER1_HOSTNAME}")
+    if [ "${WORKER_COUNT:-2}" -ge 2 ] && [ -n "${WORKER2_IP:-}" ]; then
+        entries+=("${WORKER2_USER}@${WORKER2_IP}|${WORKER2_HOSTNAME}")
+    fi
+
     for entry in "${entries[@]}"; do
         local conn="${entry%%|*}" hostname="${entry##*|}"
         log_info "加入 ${hostname}..."
+        local join_cri_socket=""
+        if [ "${CONTAINER_RUNTIME}" = "docker" ]; then
+            join_cri_socket="unix:///var/run/cri-dockerd.sock"
+        else
+            join_cri_socket="${CONTAINERD_SOCK}"
+        fi
         ssh -o StrictHostKeyChecking=no "$conn" \
-            "kubeadm join ${MASTER_IP}:${API_PORT} --token ${join_token} --discovery-token-ca-cert-hash ${join_hash} --ignore-preflight-errors=${K8S_PREFLIGHT}" 2>&1 || \
+            "export PATH=/usr/local/bin:/usr/bin:\$PATH; kubeadm join ${MASTER_IP}:${API_PORT} --token ${join_token} --discovery-token-ca-cert-hash ${join_hash} --cri-socket ${join_cri_socket} --ignore-preflight-errors=${K8S_PREFLIGHT}" 2>&1 || \
             log_warn "${hostname} 加入失败"
     done
     sleep 5
     kubectl get nodes
     kubectl label node "${WORKER1_HOSTNAME}" node-role.kubernetes.io/worker=worker --overwrite 2>/dev/null || true
-    kubectl label node "${WORKER2_HOSTNAME}" node-role.kubernetes.io/worker=worker --overwrite 2>/dev/null || true
+    if [ "${WORKER_COUNT:-2}" -ge 2 ] && [ -n "${WORKER2_HOSTNAME:-}" ]; then
+        kubectl label node "${WORKER2_HOSTNAME}" node-role.kubernetes.io/worker=worker --overwrite 2>/dev/null || true
+    fi
     log_info "Worker 加入完成"
 }
 
@@ -1124,28 +1295,31 @@ install_dashboard() {
     kubectl wait --for=condition=Ready pods --all -n ${DASH_NS} --timeout=${DASH_TMOUT}s 2>/dev/null || log_warn "Dashboard 部分未就绪"
     kubectl get pods -n ${DASH_NS}
 
-    cat > ${DASH_SVC} << EOF
-[Unit]
-Description=Dashboard Port Forward (${DASH_PORT_LOCAL} → Kong ${DASH_PORT_REMOTE})
-After=network.target
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/bin/kubectl -n ${DASH_NS} port-forward --address=0.0.0.0 ${DASH_KONG_SVC} ${DASH_PORT_LOCAL}:${DASH_PORT_REMOTE}
-Restart=on-failure
-RestartSec=10
-StandardOutput=null
-StandardError=null
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable dashboard-portforward --now
-    log_info "Dashboard: https://${MASTER_IP}:${DASH_PORT_LOCAL}"
+    # 将 Kong proxy 改为 NodePort 直接暴露 (port-forward 对 HTTPS 有问题)
+    log_info "配置 Dashboard NodePort 访问..."
+    kubectl delete svc dashboard-kong-proxy -n ${DASH_NS} 2>/dev/null || true
+    kubectl expose deployment dashboard-kong -n ${DASH_NS} \
+        --name=dashboard-kong-proxy \
+        --port=443 --target-port=8443 \
+        --type=NodePort 2>/dev/null || true
+    sleep 3
+    local nodePort
+    nodePort=$(kubectl get svc dashboard-kong-proxy -n ${DASH_NS} -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || echo "30443")
+    echo "${nodePort}" > ${K8S_DIR}/dashboard-port
+    log_info "Dashboard NodePort: ${nodePort}"
+    log_info "Dashboard: https://${MASTER_IP}:${nodePort}"
+
+    # 关闭防火墙确保端口可达
+    firewall-cmd --add-port=${nodePort}/tcp 2>/dev/null || true
+    firewall-cmd --add-port=${nodePort}/tcp --permanent 2>/dev/null || true
+    systemctl stop firewalld 2>/dev/null || true
 
     kubectl create serviceaccount ${DASH_SA} -n ${DASH_NS} 2>/dev/null || true
     kubectl create clusterrolebinding ${DASH_SA} --clusterrole=cluster-admin --serviceaccount=${DASH_NS}:${DASH_SA} 2>/dev/null || true
+    
+    # 生成登录 Token
     kubectl create token ${DASH_SA} -n ${DASH_NS} --duration=${DASH_TOKEN_TTL} 2>/dev/null > ${K8S_DIR}/dashboard-token
+    log_info "Dashboard Token 已保存到 ${K8S_DIR}/dashboard-token"
 }
 
 # ==================== SSH ====================
@@ -1160,9 +1334,25 @@ setup_ssh_keys() {
     if ssh -o BatchMode=yes -o ConnectTimeout=${SSH_TMOUT} "${user}@${ip}" "hostname" &>/dev/null; then
         log_info "免密 ${label} 已就绪"; return 0
     fi
+    
+    # 检查网络连通性
+    log_info "检查到 ${label} (${ip}) 的网络连通性..."
+    if ! ping -c 3 -W 2 "$ip" &>/dev/null; then
+        log_error "无法 ping 通 ${label} (${ip})，请检查网络连接"
+        log_error "可能原因: 节点未开机、IP 地址错误、网络配置问题"
+        exit 1
+    fi
+    log_info "网络连通正常"
+    
+    echo ""
     echo ">>> 输入 ${user}@${ip} 密码:"
-    ssh-copy-id -o StrictHostKeyChecking=no "${user}@${ip}" 2>/dev/null || { log_error "ssh-copy-id 失败"; exit 1; }
-    log_info "免密 ${label} OK"
+    ssh-copy-id -o StrictHostKeyChecking=no "${user}@${ip}"
+    if [ $? -eq 0 ]; then
+        log_info "免密 ${label} OK"
+    else
+        log_error "ssh-copy-id 失败，请检查密码是否正确"
+        exit 1
+    fi
 }
 
 # ==================== 网络 ====================
@@ -1209,12 +1399,15 @@ set_hostname() {
 
 configure_hosts() {
     cp -n /etc/hosts /etc/hosts.bak 2>/dev/null || true
-    sed -i "/${MASTER_HOSTNAME}/d; /${WORKER1_HOSTNAME}/d; /${WORKER2_HOSTNAME}/d" /etc/hosts 2>/dev/null || true
+    sed -i "/${MASTER_HOSTNAME}/d; /${WORKER1_HOSTNAME}/d" /etc/hosts 2>/dev/null || true
+    [ -n "${WORKER2_HOSTNAME:-}" ] && sed -i "/${WORKER2_HOSTNAME}/d" /etc/hosts 2>/dev/null || true
     cat >> /etc/hosts << EOF
 ${MASTER_IP}    ${MASTER_HOSTNAME}
 ${WORKER1_IP}   ${WORKER1_HOSTNAME}
-${WORKER2_IP}   ${WORKER2_HOSTNAME}
 EOF
+    if [ "${WORKER_COUNT:-2}" -ge 2 ] && [ -n "${WORKER2_IP:-}" ]; then
+        echo "${WORKER2_IP}   ${WORKER2_HOSTNAME}" >> /etc/hosts
+    fi
     log_info "hosts 已更新"
 }
 
@@ -1226,12 +1419,26 @@ disable_firewall_selinux() {
 }
 
 disable_swap() {
-    swapoff -a; sed -i '/swap/s/^/#/' /etc/fstab
-    systemctl stop dev-mapper-cs\\x2dswap.swap 2>/dev/null || true
-    systemctl mask dev-mapper-cs\\x2dswap.swap 2>/dev/null || true
-    lvchange -an /dev/mapper/cs-swap 2>/dev/null || true
-    sed -i 's/ resume=[^ "]*//g; s/ rd\.lvm\.lv=cs\/swap//g' /etc/default/grub
+    swapoff -a 2>/dev/null || true
+    sed -i '/swap/s/^/#/' /etc/fstab
+
+    # 自动检测并禁用所有 Swap 设备 (兼容 CentOS Stream 9/10 不同分区方案)
+    # 1. 禁用 systemd swap 单元
+    for swap_unit in $(systemctl list-units --type=swap --no-legend 2>/dev/null | awk '{print $1}'); do
+        systemctl stop "$swap_unit" 2>/dev/null || true
+        systemctl mask "$swap_unit" 2>/dev/null || true
+    done
+
+    # 2. 禁用 LVM Swap 逻辑卷
+    for swap_lv in $(swapon --noheadings --show=NAME 2>/dev/null | grep '/dev/mapper/' || true); do
+        lvchange -an "$swap_lv" 2>/dev/null || true
+    done
+
+    # 3. 清理 GRUB 中的 swap 相关参数
+    sed -i 's/ resume=[^ "]*//g' /etc/default/grub 2>/dev/null || true
+    sed -i 's/ rd\.lvm\.lv=[^ ]*swap[^ ]*//g' /etc/default/grub 2>/dev/null || true
     grub2-mkconfig -o /boot/grub2/grub.cfg 2>/dev/null || true
+
     log_info "Swap 已禁用"
 }
 
@@ -1276,11 +1483,26 @@ EOF
 
 install_containerd() {
     if [ "$OFFLINE_MODE" -eq 1 ]; then
-        dnf install -y containerd.io 2>/dev/null || {
-            local d="${OFFLINE_MOUNT}/${OFFLINE_RPMS_DIR}"
-            local myarch; myarch=$(uname -m)
-            rpm -ivh --nodeps "${d}"/containerd*.${myarch}.rpm 2>/dev/null || { log_error "安装失败"; exit 1; }
-        }
+        # 离线模式: 直接根据 OS 版本安装正确的 RPM (跳过 dnf install，避免安装错误版本)
+        local d="${OFFLINE_MOUNT}/${OFFLINE_RPMS_DIR}"
+        local myarch; myarch=$(uname -m)
+        # 根据 CentOS 版本选择正确的 RPM (避免 el10 的 runc 在 CentOS 9 上因 glibc 版本不兼容而失败)
+        if is_centos_stream_10; then
+            # CentOS 10: 优先 el10，回退 el9
+            rpm -ivh --nodeps "${d}"/containerd*.el10.${myarch}.rpm 2>/dev/null || \
+            rpm -ivh --nodeps "${d}"/containerd*.el9.${myarch}.rpm 2>/dev/null || \
+            rpm -ivh --nodeps "${d}"/containerd*.${myarch}.rpm 2>/dev/null || \
+            { log_error "离线安装失败，ISO 中没有兼容的 containerd RPM"; exit 1; }
+        else
+            # CentOS 9: 只安装 el9 (el10 的 runc 需要 glibc 2.38，CentOS 9 只有 2.34)
+            if ls "${d}"/containerd*.el9.${myarch}.rpm &>/dev/null; then
+                rpm -ivh --nodeps "${d}"/containerd*.el9.${myarch}.rpm 2>/dev/null || \
+                { log_error "el9 RPM 安装失败"; exit 1; }
+            else
+                log_error "ISO 中没有 el9 的 containerd RPM，请重新构建 ISO (确保包含 el9 和 el10 的 RPM)"
+                exit 1
+            fi
+        fi
     else
         dnf install -y --setopt=timeout=30 --setopt=retries=1 containerd.io
     fi
@@ -1292,7 +1514,7 @@ install_containerd() {
     sed -i "${rl}a\\
     [plugins.'io.containerd.cri.v1.images'.registry.mirrors]\\
       [plugins.'io.containerd.cri.v1.images'.registry.mirrors.\"docker.io\"]\\
-        endpoint = [\"${MIRROR_DOCKER}\"]\\
+        endpoint = [\"${MIRROR_DOCKER}\", \"https://docker.m.daocloud.io\", \"https://hub-mirror.c.163.com\", \"https://dockerhub.icu\", \"https://dockerproxy.com\"]\\
       [plugins.'io.containerd.cri.v1.images'.registry.mirrors.\"k8s.gcr.io\"]\\
         endpoint = [\"${MIRROR_K8S_GCR}\"]\\
       [plugins.'io.containerd.cri.v1.images'.registry.mirrors.\"gcr.io\"]\\
@@ -1303,31 +1525,288 @@ install_containerd() {
     systemctl daemon-reload; systemctl enable ${SVC_CONTAINERD:-containerd} --now; systemctl restart ${SVC_CONTAINERD:-containerd}
 }
 
-install_crictl() {
-    if [ -x /usr/local/bin/crictl ]; then log_info "crictl 已存在"; return 0; fi
-    local arch; arch=$(uname -m); case $arch in x86_64) arch="amd64" ;; aarch64) arch="arm64" ;; esac
-    if [ "$OFFLINE_MODE" -eq 1 ]; then
-        local b="${OFFLINE_MOUNT}/${OFFLINE_BINARIES_DIR}/crictl"
-        [ -f "$b" ] && { cp "$b" /usr/local/bin/crictl; chmod +x /usr/local/bin/crictl; log_info "crictl OK"; }
-    else
-        github_dl "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-${arch}.tar.gz" || { log_warn "crictl 下载失败"; return 0; }
-        tar -zxf "crictl-${CRICTL_VERSION}-linux-${arch}.tar.gz"
-        mv crictl /usr/local/bin/; rm -f crictl-*.tar.gz
-        log_info "crictl OK"
+# ==================== Docker Engine 安装 (仅 Docker 运行时) ====================
+install_docker() {
+    if [ "${CONTAINER_RUNTIME}" != "docker" ]; then
+        return 0
     fi
-    cat > ${CRICTL_CFG} << EOF
+
+    log_step "安装 Docker Engine"
+
+    if [ "$OFFLINE_MODE" -eq 1 ]; then
+        # 离线模式: 直接根据 OS 版本安装正确的 RPM (跳过 dnf install，避免安装错误版本)
+        local d="${OFFLINE_MOUNT}/${OFFLINE_RPMS_DIR}"
+        local myarch; myarch=$(uname -m)
+        # 根据 CentOS 版本选择正确的 RPM
+        if is_centos_stream_10; then
+            # CentOS 10: 优先 el10，回退 el9
+            rpm -ivh --nodeps "${d}"/docker-ce*.el10.${myarch}.rpm "${d}"/container*.el10.${myarch}.rpm 2>/dev/null || \
+            rpm -ivh --nodeps "${d}"/docker-ce*.el9.${myarch}.rpm "${d}"/container*.el9.${myarch}.rpm 2>/dev/null || \
+            { log_error "Docker 安装失败"; exit 1; }
+        else
+            # CentOS 9: 只安装 el9
+            if ls "${d}"/docker-ce*.el9.${myarch}.rpm &>/dev/null; then
+                rpm -ivh --nodeps "${d}"/docker-ce*.el9.${myarch}.rpm "${d}"/container*.el9.${myarch}.rpm 2>/dev/null || \
+                { log_error "Docker 安装失败"; exit 1; }
+            else
+                log_error "ISO 中没有 el9 的 Docker RPM，请重新构建 ISO (确保包含 el9 和 el10 的 RPM)"
+                exit 1
+            fi
+        fi
+    else
+        dnf install -y --setopt=timeout=30 --setopt=retries=1 docker-ce docker-ce-cli docker-ce-rootless-extras
+    fi
+
+    # 配置 Docker daemon (使用 systemd cgroup driver + 镜像加速)
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json << EOF
+{
+    "exec-opts": ["native.cgroupdriver=systemd"],
+    "log-driver": "json-file",
+    "log-opts": {
+        "max-size": "100m"
+    },
+    "storage-driver": "overlay2",
+    "registry-mirrors": [
+        "${MIRROR_DOCKER}",
+        "https://docker.m.daocloud.io",
+        "https://hub-mirror.c.163.com",
+        "https://dockerhub.icu",
+        "https://docker.rainbond.cc",
+        "https://dockerproxy.com",
+        "https://registry.cn-hangzhou.aliyuncs.com"
+    ]
+}
+EOF
+
+    systemctl daemon-reload
+    systemctl enable docker --now
+    systemctl restart docker
+    docker --version
+    log_info "Docker Engine 安装完成 (已配置镜像加速)"
+}
+
+# ==================== cri-dockerd 安装 (仅 Docker 运行时) ====================
+install_cri_dockerd() {
+    if [ "${CONTAINER_RUNTIME}" != "docker" ]; then
+        return 0
+    fi
+
+    log_step "安装 cri-dockerd"
+
+    CRI_DOCKERD_VERSION="${CRI_DOCKERD_VERSION:-0.3.21}"
+    local bin="/usr/local/bin/cri-dockerd"
+    local need_download=0
+
+    # 检查是否已安装二进制
+    if [ -x "$bin" ] && "$bin" --version 2>/dev/null | grep -q "${CRI_DOCKERD_VERSION}"; then
+        log_info "cri-dockerd ${CRI_DOCKERD_VERSION} 二进制已存在"
+    else
+        need_download=1
+    fi
+
+    # 下载 cri-dockerd (如果需要)
+    if [ $need_download -eq 1 ]; then
+        local dl_url="${CRI_DOCKERD_DOWNLOAD_URL:-https://github.com/Mirantis/cri-dockerd/releases/download/v${CRI_DOCKERD_VERSION}/cri-dockerd-${CRI_DOCKERD_VERSION}.amd64.tgz}"
+        local tgz="cri-dockerd-${CRI_DOCKERD_VERSION}.amd64.tgz"
+
+        if [ "$OFFLINE_MODE" -eq 1 ]; then
+            local offline_bin="${OFFLINE_MOUNT}/${OFFLINE_BINARIES_DIR}/cri-dockerd"
+            if [ -f "$offline_bin" ] && [ ! -d "$offline_bin" ]; then
+                cp "$offline_bin" "$bin" && chmod +x "$bin"
+            else
+                log_warn "离线模式: cri-dockerd 不存在于 ISO 中"; return 0
+            fi
+        else
+            log_info "下载 cri-dockerd v${CRI_DOCKERD_VERSION}..."
+            github_dl "$dl_url" "$tgz" || { log_error "cri-dockerd 下载失败"; return 1; }
+            tar -xzf "$tgz"
+            # cri-dockerd 解压后可能是目录或文件，需要正确处理
+            if [ -f "cri-dockerd" ] && [ ! -d "cri-dockerd" ]; then
+                mv cri-dockerd "$bin"
+            elif [ -d "cri-dockerd" ]; then
+                local found_bin
+                found_bin=$(find cri-dockerd -name "cri-dockerd" -type f 2>/dev/null | head -1) || true
+                if [ -n "$found_bin" ]; then
+                    mv "$found_bin" "$bin"
+                else
+                    log_error "cri-dockerd 二进制文件未找到"; return 1
+                fi
+            else
+                log_error "cri-dockerd 解压失败"; return 1
+            fi
+            chmod +x "$bin"
+            rm -rf "$tgz" cri-dockerd 2>/dev/null || true
+        fi
+
+        # 验证安装
+        "$bin" --version || { log_error "cri-dockerd 安装失败"; return 1; }
+    fi
+
+    # 创建 systemd 服务
+    cat > /etc/systemd/system/cri-dockerd.service << 'EOF'
+[Unit]
+Description=CRI Docker Daemon
+Documentation=https://github.com/Mirantis/cri-dockerd
+After=network-online.target firewalld.service docker.service
+Wants=network-online.target
+Requires=cri-dockerd.socket
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/cri-dockerd --container-runtime-endpoint fd://
+ExecReload=/bin/kill -s HUP $MAINPID
+TimeoutSec=0
+RestartSec=2
+Restart=always
+StartLimitBurst=3
+StartLimitInterval=60s
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+Delegate=yes
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > /etc/systemd/system/cri-dockerd.socket << 'EOF'
+[Unit]
+Description=CRI Docker Socket for the API
+PartOf=cri-dockerd.service
+
+[Socket]
+ListenStream=/var/run/cri-dockerd.sock
+SocketMode=0660
+SocketUser=root
+
+[Install]
+WantedBy=sockets.target
+EOF
+
+    # 确保 Docker 已启动并就绪
+    log_info "确保 Docker 服务已启动..."
+    systemctl enable docker --now 2>/dev/null || true
+    
+    # 等待 Docker socket 就绪
+    local docker_retries=0
+    while [ $docker_retries -lt 30 ]; do
+        if [ -S "/var/run/docker.sock" ]; then
+            log_info "Docker socket 已就绪"
+            break
+        fi
+        systemctl start docker 2>/dev/null || true
+        sleep 1
+        docker_retries=$((docker_retries + 1))
+    done
+    
+    # 验证 Docker 运行状态
+    if ! systemctl is-active docker &>/dev/null; then
+        log_error "Docker 服务未运行，尝试启动..."
+        systemctl start docker 2>/dev/null || true
+        sleep 3
+    fi
+    
+    docker --version 2>/dev/null && log_info "Docker 已就绪" || log_warn "Docker 未正确安装"
+    
+    # 确保 cri-dockerd 有权限访问 Docker socket
+    chmod 666 /var/run/docker.sock 2>/dev/null || true
+
+    systemctl daemon-reload
+    systemctl enable cri-dockerd.socket --now 2>/dev/null || true
+    systemctl enable cri-dockerd.service --now 2>/dev/null || true
+
+    # 等待 cri-dockerd socket 就绪
+    log_info "等待 cri-dockerd socket 就绪..."
+    local retries=0
+    while [ $retries -lt 30 ]; do
+        if [ -S "/var/run/cri-dockerd.sock" ]; then
+            log_info "cri-dockerd socket 已就绪"
+            break
+        fi
+        sleep 1
+        retries=$((retries + 1))
+    done
+
+    # 验证服务状态
+    if systemctl is-active cri-dockerd.service &>/dev/null && [ -S "/var/run/cri-dockerd.sock" ]; then
+        log_info "cri-dockerd v${CRI_DOCKERD_VERSION} 安装完成"
+        # 测试连接 (不使用 set -e，避免测试失败导致脚本退出)
+        local test_output
+        test_output=$(crictl --runtime-endpoint unix:///var/run/cri-dockerd.sock version 2>&1) || true
+        if echo "$test_output" | grep -q "RuntimeName"; then
+            log_info "cri-dockerd 连接测试成功"
+        else
+            log_warn "cri-dockerd 连接测试输出: $test_output"
+            # 尝试重启服务
+            log_info "尝试重启 cri-dockerd 服务..."
+            systemctl restart cri-dockerd.service 2>/dev/null || true
+            sleep 3
+            test_output=$(crictl --runtime-endpoint unix:///var/run/cri-dockerd.sock version 2>&1) || true
+            if echo "$test_output" | grep -q "RuntimeName"; then
+                log_info "cri-dockerd 连接测试成功 (重启后)"
+            else
+                log_warn "cri-dockerd 连接仍然失败: $test_output"
+                log_warn "请手动检查: journalctl -xeu cri-dockerd.service"
+            fi
+        fi
+    else
+        log_warn "cri-dockerd 服务启动失败，请检查: journalctl -xeu cri-dockerd.service"
+        log_warn "Docker 状态: $(systemctl is-active docker 2>/dev/null || echo '未运行')"
+        log_warn "Docker socket: $(ls -la /var/run/docker.sock 2>/dev/null || echo '不存在')"
+        log_warn "cri-dockerd socket: $(ls -la /var/run/cri-dockerd.sock 2>/dev/null || echo '不存在')"
+    fi
+}
+
+install_crictl() {
+    if [ -x /usr/local/bin/crictl ]; then
+        log_info "crictl 已存在"
+    else
+        local arch; arch=$(uname -m); case $arch in x86_64) arch="amd64" ;; aarch64) arch="arm64" ;; esac
+        if [ "$OFFLINE_MODE" -eq 1 ]; then
+            local b="${OFFLINE_MOUNT}/${OFFLINE_BINARIES_DIR}/crictl"
+            [ -f "$b" ] && { cp "$b" /usr/local/bin/crictl; chmod +x /usr/local/bin/crictl; }
+        else
+            github_dl "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-${arch}.tar.gz" || { log_warn "crictl 下载失败"; return 0; }
+            tar -zxf "crictl-${CRICTL_VERSION}-linux-${arch}.tar.gz"
+            mv crictl /usr/local/bin/; rm -f crictl-*.tar.gz
+        fi
+    fi
+    # 根据容器运行时配置 crictl (总是更新配置)
+    if [ "${CONTAINER_RUNTIME}" = "docker" ]; then
+        cat > ${CRICTL_CFG} << EOF
+runtime-endpoint: unix:///var/run/cri-dockerd.sock
+image-endpoint: unix:///var/run/cri-dockerd.sock
+timeout: 10
+debug: false
+EOF
+    else
+        cat > ${CRICTL_CFG} << EOF
 runtime-endpoint: ${CONTAINERD_SOCK}
 image-endpoint: ${CONTAINERD_SOCK}
 timeout: 10
 debug: false
 EOF
+    fi
     log_info "crictl OK"
 }
 
 verify_image_pull() {
     if [ "$OFFLINE_MODE" -eq 1 ]; then return 0; fi
-    crictl images 2>/dev/null | grep -q "${VERIFY_IMAGE}" && { log_info "${VERIFY_IMAGE} 镜像已存在"; return 0; }
-    timeout 60 crictl pull ${VERIFY_IMAGE} > /dev/null 2>&1 || log_warn "拉取超时"
+    
+    # 根据容器运行时选择正确的 endpoint
+    local runtime_endpoint=""
+    if [ "${CONTAINER_RUNTIME}" = "docker" ]; then
+        runtime_endpoint="--runtime-endpoint unix:///var/run/cri-dockerd.sock"
+    fi
+    
+    if crictl images 2>/dev/null | grep -q "${VERIFY_IMAGE}" 2>/dev/null; then
+        log_info "${VERIFY_IMAGE} 镜像已存在"
+        return 0
+    fi
+    timeout 60 crictl $runtime_endpoint pull ${VERIFY_IMAGE} > /dev/null 2>&1 || log_warn "拉取超时"
 }
 
 install_k8s_binaries() {
@@ -1338,20 +1817,97 @@ install_k8s_binaries() {
             rpm -ivh --nodeps "${d}"/kubeadm-*."${myarch}".rpm "${d}"/kubelet-*."${myarch}".rpm "${d}"/kubectl-*."${myarch}".rpm 2>/dev/null || { log_error "安装失败"; exit 1; }
         }
     else
-        cat > ${K8S_REPO} << 'EOF'
+        # 尝试多个 Kubernetes 镜像源 (国内优先)
+        local k8s_repo_ok=0
+        for baseurl in \
+            "https://mirrors.aliyun.com/kubernetes-new/core/stable/v1.35/rpm/" \
+            "https://mirrors.tuna.tsinghua.edu.cn/kubernetes/core:/stable:/v1.35/rpm/" \
+            "https://mirrors.ustc.edu.cn/kubernetes/core:/stable:/v1.35/rpm/" \
+            "https://pkgs.k8s.io/core:/stable:/v1.35/rpm/"; do
+            cat > ${K8S_REPO} << EOF
 [kubernetes]
 name=Kubernetes
-baseurl=https://pkgs.k8s.io/core:/stable:/v1.35/rpm/
+baseurl=${baseurl}
 enabled=1
 gpgcheck=0
 timeout=30
 EOF
-        dnf makecache; dnf install -y ${PKG_KUBEADM:-kubeadm-1.35*} ${PKG_KUBELET:-kubelet-1.35*} ${PKG_KUBECTL:-kubectl-1.35*}
+            if dnf makecache --repo=kubernetes 2>/dev/null; then
+                log_info "Kubernetes 仓库 OK: ${baseurl}"
+                k8s_repo_ok=1
+                break
+            fi
+        done
+        [ "$k8s_repo_ok" -eq 0 ] && { log_error "所有 Kubernetes 镜像源失败"; exit 1; }
+        log_info "安装 Kubernetes 组件..."
+        
+        # 先检查可用的包
+        log_info "检查可用的 Kubernetes 包..."
+        dnf list available kubeadm kubelet kubectl 2>/dev/null | grep -E "kubeadm|kubelet|kubectl" | head -10 || true
+        
+        # 尝试安装，如果失败则尝试不带版本通配符
+        if ! dnf install -y ${PKG_KUBEADM:-kubeadm-1.35*} ${PKG_KUBELET:-kubelet-1.35*} ${PKG_KUBECTL:-kubectl-1.35*} 2>/dev/null; then
+            log_warn "带版本通配符安装失败，尝试不带版本..."
+            dnf install -y kubeadm kubelet kubectl || {
+                log_error "Kubernetes 组件安装失败"
+                log_error "可能原因:"
+                log_error "  1. 网络问题"
+                log_error "  2. 仓库配置错误"
+                log_error "  3. 包名不匹配"
+                exit 1
+            }
+        fi
     fi
-    cat > ${KUBELET_CFG} << 'EOF'
+    # 根据容器运行时设置 kubelet CRI 端点
+    if [ "${CONTAINER_RUNTIME}" = "docker" ]; then
+        cat > ${KUBELET_CFG} << 'EOF'
+KUBELET_EXTRA_ARGS="--container-runtime-endpoint=unix:///var/run/cri-dockerd.sock"
+EOF
+    else
+        cat > ${KUBELET_CFG} << 'EOF'
 KUBELET_EXTRA_ARGS="--container-runtime-endpoint=unix:///run/containerd/containerd.sock"
 EOF
+    fi
     systemctl daemon-reload; systemctl enable ${SVC_KUBELET:-kubelet} --now
+}
+
+# ==================== pause 镜像预拉取 (Docker 运行时, registry.k8s.io 被墙) ====================
+prep_pause_image() {
+    if [ "${CONTAINER_RUNTIME}" != "docker" ]; then
+        return 0
+    fi
+
+    log_info "预拉取 pause 镜像 (使用国内源)..."
+
+    # 先检查是否已存在
+    if docker images registry.k8s.io/pause:3.10 2>/dev/null | grep -q "pause"; then
+        log_info "pause 镜像已存在"
+        return 0
+    fi
+
+    # 从国内源拉取并 tag
+    local pulled=0
+    for mirror in \
+        "registry.aliyuncs.com/google_containers/pause:3.10.1" \
+        "registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.10.1" \
+        "docker.1panel.live/google_containers/pause:3.10.1" \
+        "docker.1panel.live/pause:3.10.1"; do
+        if docker pull "$mirror" 2>/dev/null; then
+            log_info "从 ${mirror} 拉取 pause 镜像成功"
+            pulled=1
+            break
+        fi
+    done
+
+    if [ $pulled -eq 0 ]; then
+        log_warn "pause 镜像拉取失败，将使用 Docker Hub"
+        return 0
+    fi
+
+    # tag 为 kubelet 需要的镜像名
+    docker tag "registry.aliyuncs.com/google_containers/pause:3.10.1" "registry.k8s.io/pause:3.10.1" 2>/dev/null || true
+    docker tag "registry.aliyuncs.com/google_containers/pause:3.10.1" "registry.k8s.io/pause:3.10" 2>/dev/null || true
+    log_info "pause 镜像已 tag 为 registry.k8s.io/pause:3.10"
 }
 
 # ==================== 所有节点通用入口 ====================
@@ -1369,10 +1925,16 @@ common_prep() {
         setup_offline_repo "$OFFLINE_MOUNT"
     fi
     setup_docker_repo
-    install_containerd
+    if [ "${CONTAINER_RUNTIME}" = "docker" ]; then
+        install_docker      # Docker 运行时
+        install_cri_dockerd # Docker 运行时
+    else
+        install_containerd  # containerd 运行时
+    fi
     install_crictl
     verify_image_pull
     install_k8s_binaries
+    prep_pause_image   # Docker 运行时: 预拉取 pause 镜像
     log_info "[${hostname}] 通用准备完成"
 }
 

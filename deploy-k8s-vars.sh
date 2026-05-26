@@ -22,6 +22,14 @@ CRICTL_VERSION="v1.35.0"        # cri-tools 版本 (需与 K8s 主版本匹配)
 CALICO_VERSION="v3.32.0"        # Calico CNI 插件版本
 HELM_VERSION="v3.19.0"          # Helm 包管理器版本
 DASHBOARD_VERSION="7.14.0"     # Dashboard 版本 (已于 2026-01-21 归档退役)
+CRI_DOCKERD_VERSION="0.3.21"    # cri-dockerd 版本 (仅 Docker 运行时需要)
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║                   2.1 容器运行时选择 (仅 CentOS Stream 10)   ║
+# ╚══════════════════════════════════════════════════════════════╝
+# containerd = 使用 containerd 内置 CRI (推荐，默认)
+# docker     = 使用 Docker Engine + cri-dockerd (可选，仅 CentOS Stream 10)
+CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-containerd}"
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                   3. 集群节点配置                            ║
@@ -69,7 +77,14 @@ EXCLUDE_IFACE_FILTER="lo|virbr|docker|br-|veth|tun|tap|vnet|ovs|cali|kube"
 # ---- 操作系统仓库 ----
 DOCKER_CE_REPO_URL="https://download.docker.com/linux/centos/docker-ce.repo"
 
-KUBERNETES_REPO_BASEURL="https://pkgs.k8s.io/core:/stable:/v1.35/rpm/"
+# ---- Kubernetes 仓库 (国内镜像优先) ----
+KUBERNETES_REPO_MIRRORS=(
+    "https://mirrors.aliyun.com/kubernetes-new/core/stable/v1.35/rpm/"
+    "https://mirrors.tuna.tsinghua.edu.cn/kubernetes/core:/stable:/v1.35/rpm/"
+    "https://mirrors.ustc.edu.cn/kubernetes/core:/stable:/v1.35/rpm/"
+    "https://pkgs.k8s.io/core:/stable:/v1.35/rpm/"
+)
+KUBERNETES_REPO_BASEURL="${KUBERNETES_REPO_MIRRORS[0]}"  # 默认使用阿里云
 KUBERNETES_REPO_GPGKEY="https://pkgs.k8s.io/core:/stable:/v1.35/rpm/repodata/repomd.xml.key"
 
 # ---- GitHub 下载地址 ----
@@ -77,6 +92,7 @@ CRICTL_DOWNLOAD_URL="https://github.com/kubernetes-sigs/cri-tools/releases/downl
 CALICO_MANIFEST_URL="https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico.yaml"
 HELM_DOWNLOAD_URL="https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
 DASHBOARD_DOWNLOAD_URL="https://github.com/kubernetes-retired/dashboard/releases/download/kubernetes-dashboard-${DASHBOARD_VERSION}/kubernetes-dashboard-${DASHBOARD_VERSION}.tgz"
+CRI_DOCKERD_DOWNLOAD_URL="https://github.com/Mirantis/cri-dockerd/releases/download/v${CRI_DOCKERD_VERSION}/cri-dockerd-${CRI_DOCKERD_VERSION}.amd64.tgz"
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                   6. 容器镜像 & 代理                         ║
@@ -90,8 +106,17 @@ DEFAULT_PAUSE_IMAGE="registry.k8s.io/pause:3.10.1"            # 官方 (被墙)
 PAUSE_IMAGE="registry.aliyuncs.com/google_containers/pause:3.10.1"  # 阿里云替代
 
 # ---- 镜像代理 (Containerd mirrors) ----
-# docker.io 代理 — docker.1panel.live 是唯一实测 blob 全量缓存的稳定站
+# docker.io 代理 — 多个镜像源，自动切换
 MIRROR_DOCKER_ENDPOINT="https://docker.1panel.live"
+MIRROR_DOCKER_ENDPOINTS=(
+    "https://docker.1panel.live"
+    "https://docker.m.daocloud.io"
+    "https://hub-mirror.c.163.com"
+    "https://dockerhub.icu"
+    "https://docker.rainbond.cc"
+    "https://dockerproxy.com"
+    "https://registry.cn-hangzhou.aliyuncs.com"
+)
 MIRROR_K8S_GCR_ENDPOINT="https://registry.k8s.io"
 MIRROR_GCR_ENDPOINT="https://gcr.m.daocloud.io"
 MIRROR_QUAY_ENDPOINT="https://quay.m.daocloud.io"
@@ -118,8 +143,8 @@ SELINUX_CONFIG="/etc/selinux/config"
 FSTAB_FILE="/etc/fstab"
 GRUB_DEFAULT="/etc/default/grub"
 GRUB_CFG="/boot/grub2/grub.cfg"
-SWAP_DEVICE="/dev/mapper/cs-swap"
-SWAP_UNIT="dev-mapper-cs\\x2dswap.swap"
+# Swap 设备现在自动检测，不再硬编码 (兼容 CentOS Stream 9/10 不同分区方案)
+# SWAP_DEVICE 和 SWAP_UNIT 已移至脚本动态检测
 
 # ---- 内核 ----
 MODULES_LOAD_DIR="/etc/modules-load.d"
@@ -157,10 +182,7 @@ WORKER2_LOG="/tmp/worker2-deploy.log"
 # ---- Dashboard ----
 DASHBOARD_NAMESPACE="kubernetes-dashboard"
 DASHBOARD_SA="dashboard-admin"
-DASHBOARD_PORT_FORWARD_SERVICE="/etc/systemd/system/dashboard-portforward.service"
-DASHBOARD_PORT_FORWARD_LOCAL="8443"
-DASHBOARD_PORT_FORWARD_REMOTE="443"
-DASHBOARD_KONG_SVC="svc/dashboard-kong-proxy"
+# NodePort 直接暴露 (替代 port-forward，更稳定)
 DASHBOARD_TOKEN_DURATION="24h"
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -222,6 +244,7 @@ OFFLINE_DASHBOARD_IMAGES="dashboard-images.tar"
 # 本地文件 (相对于 OFFLINE_BINARIES_DIR)
 OFFLINE_CRICTL_TGZ="crictl-${CRICTL_VERSION}-linux-amd64.tar.gz"
 OFFLINE_HELM_TGZ="helm-${HELM_VERSION}-linux-amd64.tar.gz"
+OFFLINE_CRI_DOCKERD_TGZ="cri-dockerd-${CRI_DOCKERD_VERSION}.amd64.tgz"  # 仅 Docker 运行时
 
 # 本地清单 (相对于 OFFLINE_MANIFESTS_DIR)
 OFFLINE_CALICO_YAML="calico.yaml"
