@@ -112,6 +112,7 @@ log_step()  { echo -e "\n${BLUE}========== $* ==========${NC}"; }
 # ==================== 运行模式判断 ====================
 REMOTE_MODE=0
 OFFLINE_MODE=0
+OFFLINE_KUBEADM_LOADED=0  # 标记 kubeadm 镜像是否已导入
 OFFLINE_ISO="${OFFLINE_ISO:-/root/k8s-offline-repo.iso}"
 OFFLINE_MOUNT="${OFFLINE_MOUNT:-/mnt/k8s-offline}"
 OFFLINE_REMOTE_FLAG=""
@@ -347,13 +348,11 @@ setup_offline_repo() {
         elif command -v createrepo &>/dev/null; then
             createrepo "$mnt" 2>/dev/null
         else
-            dnf install -y createrepo_c 2>/dev/null || true
-            if command -v createrepo_c &>/dev/null; then
-                createrepo_c "$mnt" 2>/dev/null
-            else
-                log_error "未找到 repodata 且无法安装 createrepo。请确保 ISO 包含 repodata/ 目录或 RPM 仓库元数据"
-                exit 1
-            fi
+            # 离线模式无法从网络安装 createrepo_c
+            log_error "未找到 repodata 且系统未安装 createrepo_c/createrepo。"
+            log_error "请确保 ISO 包含 repodata/ 目录（由 build-offline-iso.sh 自动生成）"
+            log_error "或在构建 ISO 的机器上安装 createrepo_c 后重新构建"
+            exit 1
         fi
         repo_base="$mnt"
     fi
@@ -388,9 +387,33 @@ load_offline_images() {
     local img_dir="${mnt}/${OFFLINE_IMAGES_DIR}"
     local pattern
 
+    # 根据运行时选择导入命令，支持 Docker 和 containerd 两种格式
+    import_image() {
+        local tarfile="$1"
+        if [ "${CONTAINER_RUNTIME}" = "docker" ]; then
+            # 先尝试 docker load
+            local load_output
+            load_output=$(docker load -i "$tarfile" 2>&1)
+            if [ $? -eq 0 ]; then
+                return 0
+            fi
+            # docker load 失败，记录错误并尝试 ctr
+            log_warn "docker load 失败: $load_output"
+            if ctr -n k8s.io images import "$tarfile" 2>/dev/null; then
+                log_info "  ctr 导入成功"
+                return 0
+            fi
+            return 1
+        else
+            ctr -n k8s.io images import "$tarfile" &>/dev/null
+        fi
+    }
+
     case "$kind" in
         kubeadm)   pattern="registry.aliyuncs.com_google_containers_*.tar" ;;
         calico)    pattern="quay.io_calico_*.tar" ;;
+        # pause 镜像单独处理，文件名可能是 registry.k8s.io_pause_*.tar
+        pause)     pattern="*pause*.tar" ;;
         dashboard) 
             # 先导入 Dashboard 组件镜像，再尝试 Kong
             local count1=0 failed1=0
@@ -398,7 +421,7 @@ load_offline_images() {
                 [ -f "$tarfile" ] || continue
                 [ -s "$tarfile" ] || { log_warn "跳过空文件: $(basename "$tarfile")"; continue; }
                 local fname=$(basename "$tarfile")
-                if ctr -n k8s.io images import "$tarfile" &>/dev/null; then
+                if import_image "$tarfile"; then
                     log_info "✓ ${fname}"; count1=$((count1 + 1))
                 else
                     log_warn "导入失败: ${fname}"; failed1=$((failed1 + 1))
@@ -407,7 +430,7 @@ load_offline_images() {
             # Kong 镜像 (如果存在)
             local kong_tar="${img_dir}/kong_3.9.tar"
             if [ -f "$kong_tar" ] && [ -s "$kong_tar" ]; then
-                if ctr -n k8s.io images import "$kong_tar" &>/dev/null; then
+                if import_image "$kong_tar"; then
                     log_info "✓ kong_3.9.tar"; count1=$((count1 + 1))
                 else
                     log_warn "导入失败: kong_3.9.tar"; failed1=$((failed1 + 1))
@@ -429,7 +452,7 @@ load_offline_images() {
         [ -s "$tarfile" ] || { log_warn "跳过空文件: $(basename "$tarfile")"; continue; }
 
         local fname=$(basename "$tarfile")
-        if ctr -n k8s.io images import "$tarfile" &>/dev/null; then
+        if import_image "$tarfile"; then
             log_info "✓ ${fname}"
             count=$((count + 1))
         else
@@ -447,21 +470,32 @@ load_offline_images() {
 
 # 导出 Master 所有镜像 → SCP 到 Worker (避免 Worker 各自拉取)
 sync_images_to_workers() {
-    # Docker 运行时跳过 (使用 Docker registry mirrors 拉取)
-    if [ "${CONTAINER_RUNTIME}" = "docker" ]; then
-        log_info "Docker 运行时: 跳过 ctr 镜像同步 (Worker 将通过 Docker registry mirrors 拉取)"
-        return 0
-    fi
-
     local sync_dir="/tmp/k8s-sync-images"
     rm -rf "$sync_dir"; mkdir -p "$sync_dir"
 
-    log_info "导出 Master 镜像供 Worker 使用..."
-    ctr -n k8s.io images list -q 2>/dev/null | while read -r img; do
-        [ -z "$img" ] && continue
-        local fname="${sync_dir}/$(echo "$img" | sed 's|[/:@]|_|g').tar"
-        ctr -n k8s.io images export "$fname" "$img" 2>/dev/null || true
-    done || true
+    if [ "${CONTAINER_RUNTIME}" = "docker" ]; then
+        # Docker 运行时: 离线模式需要同步镜像，在线模式 Worker 通过 registry mirrors 自己拉取
+        if [ "$OFFLINE_MODE" -eq 0 ]; then
+            log_info "Docker 运行时 (在线): Worker 将通过 Docker registry mirrors 拉取镜像"
+            return 0
+        fi
+
+        log_info "Docker 运行时 (离线): 导出 Master 镜像供 Worker 使用..."
+        # 导出所有 Docker 镜像
+        docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | while read -r img; do
+            [ -z "$img" ] || [ "$img" = "<none>:<none>" ] && continue
+            local fname="${sync_dir}/$(echo "$img" | sed 's|[/:@]|_|g').tar"
+            docker save "$img" -o "$fname" 2>/dev/null || true
+        done || true
+    else
+        # containerd 运行时
+        log_info "导出 Master 镜像供 Worker 使用..."
+        ctr -n k8s.io images list -q 2>/dev/null | while read -r img; do
+            [ -z "$img" ] && continue
+            local fname="${sync_dir}/$(echo "$img" | sed 's|[/:@]|_|g').tar"
+            ctr -n k8s.io images export "$fname" "$img" 2>/dev/null || true
+        done || true
+    fi
 
     local count
     count=$(ls "$sync_dir"/*.tar 2>/dev/null | wc -l)
@@ -475,13 +509,26 @@ sync_images_to_workers() {
 
     for w in "${workers[@]}"; do
         log_info "同步 ${count} 个镜像到 ${w}..."
+        ssh -o StrictHostKeyChecking=no "$w" "mkdir -p /tmp/k8s-sync-images" 2>/dev/null || true
         scp -o StrictHostKeyChecking=no "$sync_dir"/*.tar "$w:/tmp/k8s-sync-images/" 2>/dev/null || { log_warn "SCP 失败: ${w}"; continue; }
-        ssh -o StrictHostKeyChecking=no "$w" "
-            for t in /tmp/k8s-sync-images/*.tar; do
-                [ -s \"\$t\" ] && ctr -n k8s.io images import \"\$t\" 2>/dev/null
-            done
-            rm -rf /tmp/k8s-sync-images
-        " 2>/dev/null &
+
+        if [ "${CONTAINER_RUNTIME}" = "docker" ]; then
+            # Docker: 使用 docker load 导入
+            ssh -o StrictHostKeyChecking=no "$w" "
+                for t in /tmp/k8s-sync-images/*.tar; do
+                    [ -s \"\$t\" ] && docker load -i \"\$t\" 2>/dev/null
+                done
+                rm -rf /tmp/k8s-sync-images
+            " 2>/dev/null &
+        else
+            # containerd: 使用 ctr import 导入
+            ssh -o StrictHostKeyChecking=no "$w" "
+                for t in /tmp/k8s-sync-images/*.tar; do
+                    [ -s \"\$t\" ] && ctr -n k8s.io images import \"\$t\" 2>/dev/null
+                done
+                rm -rf /tmp/k8s-sync-images
+            " 2>/dev/null &
+        fi
     done
     wait
     rm -rf "$sync_dir"
@@ -915,10 +962,14 @@ interactive_main() {
             ssh -o StrictHostKeyChecking=no "$w" "chmod +x /usr/local/bin/cri-dockerd" 2>/dev/null || true
         fi
 
-        # 镜像
+        # 镜像 - 根据运行时选择导入命令
         if [ -d /tmp/k8s-images ] && ls /tmp/k8s-images/*.tar &>/dev/null; then
             scp -o StrictHostKeyChecking=no /tmp/k8s-images/*.tar "$w:/tmp/k8s-images/" 2>/dev/null || log_warn "SCP 镜像到 ${w} 失败"
-            ssh -o StrictHostKeyChecking=no "$w" "for t in /tmp/k8s-images/*.tar; do [ -s \"\$t\" ] && ctr -n k8s.io images import \"\$t\" 2>/dev/null && echo \"✓ \$(basename \$t)\"; done; rm -f /tmp/k8s-images/*.tar" 2>/dev/null || true
+            if [ "${CONTAINER_RUNTIME}" = "docker" ]; then
+                ssh -o StrictHostKeyChecking=no "$w" "for t in /tmp/k8s-images/*.tar; do [ -s \"\$t\" ] && docker load -i \"\$t\" 2>/dev/null && echo \"✓ \$(basename \$t)\"; done; rm -f /tmp/k8s-images/*.tar" 2>/dev/null || true
+            else
+                ssh -o StrictHostKeyChecking=no "$w" "for t in /tmp/k8s-images/*.tar; do [ -s \"\$t\" ] && ctr -n k8s.io images import \"\$t\" 2>/dev/null && echo \"✓ \$(basename \$t)\"; done; rm -f /tmp/k8s-images/*.tar" 2>/dev/null || true
+            fi
         fi
     done
 
@@ -1078,25 +1129,45 @@ cgroupDriver: ${CGROUP}
 EOF
 
     if [ "$OFFLINE_MODE" -eq 1 ]; then
-        load_offline_images "kubeadm"
+        # 如果镜像已在 common_prep 中导入，跳过重复导入
+        if [ "$OFFLINE_KUBEADM_LOADED" -ne 1 ]; then
+            load_offline_images "kubeadm"
+            load_offline_images "pause"
+        else
+            log_info "kubeadm 镜像已导入，跳过重复加载"
+        fi
     else
         kubeadm config images pull --config ${KUBEADM_YAML} --cri-socket "${cri_socket}"
     fi
 
-    # Docker 运行时: 预拉取 pause 镜像并 tag (registry.k8s.io 被墙)
+    # Docker 运行时: 确保 pause 镜像存在并正确 tag
     if [ "${CONTAINER_RUNTIME}" = "docker" ]; then
-        log_info "预拉取 pause 镜像 (使用国内源)..."
         local pause_mirror="${KUBEADM_IMAGE_REPO}/pause:3.10.1"
-        local pause_official="${PAUSE_IMAGE}"
-        if ! docker pull "${pause_mirror}" 2>/dev/null; then
-            # 回退: 尝试多个国内源
-            docker pull "registry.aliyuncs.com/google_containers/pause:3.10.1" 2>/dev/null || \
-            docker pull "registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.10.1" 2>/dev/null || \
-            docker pull "pause:3.10.1" 2>/dev/null
+        local pause_official="registry.k8s.io/pause:3.10.1"
+        local pause_official_short="registry.k8s.io/pause:3.10"
+
+        if [ "$OFFLINE_MODE" -eq 1 ]; then
+            # 离线模式: 镜像已从 ISO 导入，只需检查和 tag
+            log_info "离线模式: 检查 pause 镜像..."
+            if docker image inspect "${pause_mirror}" &>/dev/null; then
+                docker tag "${pause_mirror}" "${pause_official}" 2>/dev/null || true
+                docker tag "${pause_mirror}" "${pause_official_short}" 2>/dev/null || true
+                log_info "pause 镜像已就绪 (从 ISO 导入)"
+            else
+                log_warn "pause 镜像未在本地找到，请确认 ISO 包含该镜像"
+            fi
+        else
+            # 在线模式: 从国内源拉取
+            log_info "预拉取 pause 镜像 (使用国内源)..."
+            if ! docker pull "${pause_mirror}" 2>/dev/null; then
+                docker pull "registry.aliyuncs.com/google_containers/pause:3.10.1" 2>/dev/null || \
+                docker pull "registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.10.1" 2>/dev/null || \
+                docker pull "pause:3.10.1" 2>/dev/null
+            fi
+            docker tag "${pause_mirror}" "${pause_official}" 2>/dev/null || true
+            docker tag "${pause_mirror}" "${pause_official_short}" 2>/dev/null || true
+            log_info "pause 镜像已准备好"
         fi
-        docker tag "registry.aliyuncs.com/google_containers/pause:3.10.1" "registry.k8s.io/pause:3.10.1" 2>/dev/null || true
-        docker tag "registry.aliyuncs.com/google_containers/pause:3.10.1" "registry.k8s.io/pause:3.10" 2>/dev/null || true
-        log_info "pause 镜像已准备好"
     fi
 
     # 重启 cri-dockerd 确保 socket 状态正常 (Docker 运行时)
@@ -1180,7 +1251,8 @@ install_calico() {
     if [ "$OFFLINE_MODE" -eq 1 ]; then
         load_offline_images "calico"
         cp "${OFFLINE_MOUNT}/${OFFLINE_MANIFESTS_DIR}/calico.yaml" calico.yaml
-        sed -i 's|imagePullPolicy: Always|imagePullPolicy: IfNotPresent|g' calico.yaml 2>/dev/null || true
+        # 离线模式: 强制 Never，禁止任何网络拉取
+        sed -i 's|imagePullPolicy:.*|imagePullPolicy: Never|g' calico.yaml 2>/dev/null || true
     else
         if [ -f /root/calico.yaml ]; then
             log_info "使用本地 calico.yaml"
@@ -1733,25 +1805,6 @@ EOF
     # 验证服务状态
     if systemctl is-active cri-dockerd.service &>/dev/null && [ -S "/var/run/cri-dockerd.sock" ]; then
         log_info "cri-dockerd v${CRI_DOCKERD_VERSION} 安装完成"
-        # 测试连接 (不使用 set -e，避免测试失败导致脚本退出)
-        local test_output
-        test_output=$(crictl --runtime-endpoint unix:///var/run/cri-dockerd.sock version 2>&1) || true
-        if echo "$test_output" | grep -q "RuntimeName"; then
-            log_info "cri-dockerd 连接测试成功"
-        else
-            log_warn "cri-dockerd 连接测试输出: $test_output"
-            # 尝试重启服务
-            log_info "尝试重启 cri-dockerd 服务..."
-            systemctl restart cri-dockerd.service 2>/dev/null || true
-            sleep 3
-            test_output=$(crictl --runtime-endpoint unix:///var/run/cri-dockerd.sock version 2>&1) || true
-            if echo "$test_output" | grep -q "RuntimeName"; then
-                log_info "cri-dockerd 连接测试成功 (重启后)"
-            else
-                log_warn "cri-dockerd 连接仍然失败: $test_output"
-                log_warn "请手动检查: journalctl -xeu cri-dockerd.service"
-            fi
-        fi
     else
         log_warn "cri-dockerd 服务启动失败，请检查: journalctl -xeu cri-dockerd.service"
         log_warn "Docker 状态: $(systemctl is-active docker 2>/dev/null || echo '未运行')"
@@ -1877,15 +1930,27 @@ prep_pause_image() {
         return 0
     fi
 
-    log_info "预拉取 pause 镜像 (使用国内源)..."
-
     # 先检查是否已存在
     if docker images registry.k8s.io/pause:3.10 2>/dev/null | grep -q "pause"; then
         log_info "pause 镜像已存在"
         return 0
     fi
 
-    # 从国内源拉取并 tag
+    if [ "$OFFLINE_MODE" -eq 1 ]; then
+        # 离线模式: 镜像已从 ISO 导入，只需 tag
+        log_info "离线模式: 检查 pause 镜像..."
+        if docker image inspect "registry.aliyuncs.com/google_containers/pause:3.10.1" &>/dev/null; then
+            docker tag "registry.aliyuncs.com/google_containers/pause:3.10.1" "registry.k8s.io/pause:3.10.1" 2>/dev/null || true
+            docker tag "registry.aliyuncs.com/google_containers/pause:3.10.1" "registry.k8s.io/pause:3.10" 2>/dev/null || true
+            log_info "pause 镜像已就绪 (从 ISO 导入)"
+        else
+            log_warn "pause 镜像未在本地找到，请确认 ISO 包含该镜像"
+        fi
+        return 0
+    fi
+
+    # 在线模式: 从国内源拉取并 tag
+    log_info "预拉取 pause 镜像 (使用国内源)..."
     local pulled=0
     for mirror in \
         "registry.aliyuncs.com/google_containers/pause:3.10.1" \
@@ -1933,8 +1998,17 @@ common_prep() {
     fi
     install_crictl
     verify_image_pull
-    install_k8s_binaries
-    prep_pause_image   # Docker 运行时: 预拉取 pause 镜像
+    # 离线模式: 在 kubelet 启动前导入镜像（Master 和 Worker 都需要）
+    if [ "$OFFLINE_MODE" -eq 1 ]; then
+        log_info "离线模式: 导入镜像..."
+        load_offline_images "kubeadm"
+        load_offline_images "pause"
+        load_offline_images "calico"  # Calico 镜像也需要提前导入
+        OFFLINE_KUBEADM_LOADED=1
+        log_info "离线模式: 镜像导入完成"
+    fi
+    install_k8s_binaries  # kubelet 在这里启动
+    prep_pause_image   # Docker 运行时: 确保 pause 镜像存在
     log_info "[${hostname}] 通用准备完成"
 }
 
